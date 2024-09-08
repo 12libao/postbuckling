@@ -98,6 +98,45 @@ def populate_Be_and_Te(nelems, xi, eta, xe, ye, Be, Te):
     return detJ
 
 
+def populate_nonlinear_strain_and_Be(Be, ueve, Be_nl, strain_nl=None, strain_li=None):
+    """
+    Populate B matrices for all elements at a quadrature point
+    """
+    Nx = Be[:, 0, ::2]
+    Ny = Be[:, 1, 1::2]
+
+    ue = ueve[:, ::2]
+    ve = ueve[:, 1::2]
+
+    ux = np.sum(ue * Nx, axis=1)[..., np.newaxis]
+    uy = np.sum(ue * Ny, axis=1)[..., np.newaxis]
+
+    vx = np.sum(ve * Nx, axis=1)[..., np.newaxis]
+    vy = np.sum(ve * Ny, axis=1)[..., np.newaxis]
+
+    if strain_li is not None:
+        strain_li[:, 0] = (ux).flatten()
+        strain_li[:, 1] = (vy).flatten()
+        strain_li[:, 2] = (uy + vx).flatten()
+
+    if strain_nl is not None:
+        strain_nl[:, 0] = (ux + 0.5 * (ux**2 + vx**2)).flatten()
+        strain_nl[:, 1] = (vy + 0.5 * (uy**2 + vy**2)).flatten()
+        strain_nl[:, 2] = (uy + vx + ux * uy + vx * vy).flatten()
+
+    # Set the B matrix for each element
+    Be_nl[:, 0, ::2] = ux * Nx
+    Be_nl[:, 0, 1::2] = vx * Nx
+
+    Be_nl[:, 1, ::2] = uy * Ny
+    Be_nl[:, 1, 1::2] = vy * Ny
+
+    Be_nl[:, 2, ::2] = uy * Nx + ux * Ny
+    Be_nl[:, 2, 1::2] = vy * Nx + vx * Ny
+
+    return
+
+
 def compute_detJ(nelems, xi, eta, xe, ye):
     J = np.zeros((nelems, 2, 2))
 
