@@ -1,7 +1,8 @@
 import os
 
+from icecream import ic
 import numpy as np
-
+import time
 
 class BucklingOpt:
 
@@ -24,6 +25,17 @@ class BucklingOpt:
     def initialize(self):
         self.topo.initialize()
         self.BLF = self.topo.BLF
+        self.l0 = self.topo.lam[0]
+        self.Q0 = self.topo.Q[:, 0]
+        return
+
+    def initialize_koiter(self, Q0_norm=None):
+        self.Q0_norm = Q0_norm
+        self.topo.initialize_koiter(self.Q0_norm)
+        self.a = self.topo.a
+        self.b = self.topo.b
+        self.da = None
+        self.db = None
         return
 
     def initialize_adjoint(self):
@@ -73,3 +85,105 @@ class BucklingOpt:
 
     def get_area_derivative(self):
         return self.topo.eval_area_gradient()
+
+    def get_koiter_a(self):
+        return np.abs(self.a)
+
+    def get_dadx(self):
+        t1 = time.time()
+        
+        if self.da is None:
+            self.da = self.topo.get_dadx(self.topo.rhoE, self.topo.l0, self.topo.Q0)
+
+        t2 = time.time()
+        self.topo.profile["koiter time"] += t2 - t1
+        
+        return self.da
+
+    def get_dbdx(self):
+        t1 = time.time()
+        
+        if self.db is None:
+            self.db = self.topo.get_dbdx(self.topo.rhoE, self.topo.l0, self.topo.Q0)
+        
+        t2 = time.time()
+        self.topo.profile["koiter time"] += t2 - t1
+        
+        return self.db
+
+    def get_dldx(self):
+        return self.topo.get_dldx()
+
+    def get_koiter_da(self):
+        da = self.get_dadx()
+        if self.a < 0:
+            da = -da
+        return da
+
+    def get_koiter_b(self):
+        return self.b
+
+    def get_koiter_db(self):
+        return self.get_dbdx()
+
+    def get_koiter_al0(self):
+
+        al0 = self.l0 / self.a
+
+        if self.a < 0:
+            al0 *= -1
+
+        return al0
+
+    def get_koiter_dal0(self):
+        da = self.get_dadx()
+        dl0 = self.get_dldx()
+
+        dal0dx = dl0 / self.a - self.l0 / self.a**2 * da
+
+        if self.a < 0:
+            return -dal0dx
+
+        return dal0dx
+
+    def get_koiter_lams(self, xi=1e-3):
+        if self.Q0_norm is None:
+            Q0_norm = np.linalg.norm(self.Q0)
+        xi = xi * Q0_norm
+        return self.topo.get_lam_s(self.l0, self.a, xi)
+
+    def get_koiter_dlams(self, xi=1e-3):
+        da = self.get_dadx()
+        dl = self.get_dldx()
+        
+        if self.Q0_norm is None:
+            Q0_norm = np.linalg.norm(self.Q0)
+            xi = xi * Q0_norm
+        return self.topo.get_dlamsdx(self.l0, self.a, dl, da, xi)
+    
+    def get_koiter_ks_lams(self, xi=1e-3):
+        if self.Q0_norm is None:
+            Q0_norm = np.linalg.norm(self.Q0)
+            xi = xi * Q0_norm
+            ic(xi)
+        return self.topo.get_ks_lams(self.a, xi, self.ks_rho)
+    
+    def get_koiter_ks_dlams(self, xi=1e-3):
+        if self.Q0_norm is None:
+            Q0_norm = np.linalg.norm(self.Q0)
+            xi = xi * Q0_norm
+        da = self.get_dadx()
+        return self.topo.get_ks_lams_derivatives(self.a, da, xi, self.ks_rho)
+
+    def get_koiter_normalized_lams(self, xi=1e-3):
+        if self.Q0_norm is None:
+            Q0_norm = np.linalg.norm(self.Q0)
+            xi = xi * Q0_norm
+        return self.topo.get_flam_s(self.l0, self.a, xi)
+
+    def get_koiter_normalized_dlams(self, xi=1e-3):
+        da = self.get_dadx()
+        if self.Q0_norm is None:
+            Q0_norm = np.linalg.norm(self.Q0)
+            xi = xi * Q0_norm
+        return self.topo.get_dflamsdx(self.a, da, xi)

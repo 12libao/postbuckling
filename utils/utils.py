@@ -74,7 +74,7 @@ class Logger:
         self.draw_every = 5
         self.profile = paropt.prob.topo.profile
 
-        self.foi = OrderedDict({"volume_frac": "n/a"})
+        self.foi = OrderedDict({"volume": "n/a"})
 
         logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 
@@ -202,8 +202,8 @@ class Logger:
         if self.iter % (10 * self.draw_every) == 0 and self.iter != 0:
             self.write_optimization()
 
-        if self.iter % (10 * self.draw_every) == 0:
-            self.write_eigenvectors(x=8, y=4)
+        if self.iter % (4 * self.draw_every) == 0:
+            self.write_eigenvectors(x=1, y=1)
             self.write_vtk_natrual_frequency()
 
         if self.iter % (4 * self.draw_every) == 0:
@@ -212,7 +212,6 @@ class Logger:
                 and self.profile["adjoint_method"] != "approx-lanczos"
             ):
                 self.write_residuals()
-            self.write_time()
 
     def set_interpolation_parameters(self):
         if not self.grad_check:
@@ -371,7 +370,11 @@ class Logger:
         vtk_nodal_vecs = {}
 
         # Assign the nodal solutions
-        xfull = self.prob.topo.x[self.prob.topo.fltr.dvmap]
+        if self.prob.topo.fltr.dvmap is not None:
+            xfull = self.prob.topo.x[self.prob.topo.fltr.dvmap]
+        else:
+            xfull = self.prob.topo.x
+
         vtk_nodal_sols["design"] = xfull
         vtk_nodal_sols["rho"] = self.prob.topo.rho[:]
         for i in range(self.prob.topo.N):
@@ -403,10 +406,16 @@ class Logger:
 
         if self.args.objf == "frequency":
             self.foi["lam"] = self.prob.topo.lam[0]
-        self.foi["volume_frac"] = self.paropt.vol_frac
+        self.foi["volume"] = self.paropt.vol_frac
 
         if "compliance" in self.args.confs:
             self.foi["compliance"] = self.paropt.c
+
+        # if "ks-buckling" in self.args.confs:
+        #     self.foi["ks"] = self.paropt.BLF_ks
+
+        if self.args.objf == "ks-buckling" or self.args.objf == "koiter-ks-lams":
+            self.foi["BLF0"] = self.paropt.prob.topo.BLF[0]
 
         if "aggregate" in self.args.confs:
             self.foi["aggregate"] = self.paropt.h
@@ -416,48 +425,43 @@ class Logger:
             self.foi["ks/ks0"] = self.paropt.ks_norm
             self.foi["BLF0"] = self.prob.topo.BLF[0]
 
-        nfactor_eig = self.profile["solve preconditioner count"]
-        nfactor_solve = self.profile["adjoint preconditioner count"]
-
         teig = self.profile["eigenvalue solve time"]
-        tsolve = self.profile["adjoint solution time"]
+        tkoiter = self.profile["koiter time"]
         tderiv = self.profile["total derivative time"]
 
         # Log function values and time
-        if full_output:
-            if self.iter % 10 == 0:
-                Log.log("\n%5s%20s" % ("iter", "obj"), end="")
-                for k in self.foi.keys():
-                    Log.log("%20s" % k, end="")
-                Log.log(
-                    "%8s%8s%10s%10s%10s"
-                    % ("nfeig", "nfsol", "teig(s)", "tsol(s)", "tdev(s)")
-                )
+        if self.iter % 10 == 0:
+            Log.log("\n%4s%15s" % ("iter", "obj"), end="")
 
-            Log.log("%5d%20.8e" % (self.iter, self.paropt.obj), end="")
-            for v in self.foi.values():
-                if not isinstance(v, str):
-                    v = "%20.8e" % v
-                Log.log("%20s" % v, end="")
+            for k in self.foi.keys():
+                Log.log("%10s" % k, end="")
 
             Log.log(
-                "%8d%8d%10.3f%10.3f%10.3f"
-                % (nfactor_eig, nfactor_solve, teig, tsolve, tderiv)
+                "%10s%10s%10s%10s%10s" % ("1e-5", "1e-4", "1e-3", "1e-2", "1e-1"),
+                end="",
             )
-        else:
-            if self.iter % 10 == 0:
-                Log.log("\n%5s%20s" % ("iter", "obj"), end="")
-                for k in self.foi.keys():
-                    Log.log("%20s" % k, end="")
-                Log.log("%10s%10s%10s" % ("teig(s)", "tsol(s)", "tdev(s)"))
 
-            Log.log("%5d%20.8e" % (self.iter, self.paropt.obj), end="")
-            for v in self.foi.values():
-                if not isinstance(v, str):
-                    v = "%20.8e" % v
-                Log.log("%20s" % v, end="")
+            Log.log("%13s%13s" % ("a", "b"), end="")
+            # Log.log("%10s%10s%10s" % ("eig", "dev", "koiter"))
+            Log.log("")
 
-            Log.log("%10.3f%10.3f%10.3f" % (teig, tsolve, tderiv))
+        Log.log("%4d%15.5e" % (self.iter, self.paropt.obj), end="")
+
+        for v in self.foi.values():
+            if not isinstance(v, str):
+                Log.log("%10.3f" % v, end="")
+
+        xib = [1e-5, 1e-4, 1e-3, 1e-2, 1e-1]
+        for xi in xib:
+            xi *= np.linalg.norm(self.prob.topo.Q0)
+            aa = np.abs(self.prob.topo.a * xi)
+            lam_s = self.prob.topo.lam[0] * (1 + 2 * aa - 2 * np.sqrt(aa + aa**2))
+            Log.log("%10.3f" % lam_s, end="")
+
+        Log.log("%13.3e%13.3e" % (self.prob.topo.a, self.prob.topo.b), end="")
+        Log.log("")
+
+        # Log.log("%10.3f%10.3f%10.3f" % (teig, tderiv, tkoiter))
 
         return
 
@@ -578,6 +582,9 @@ class Logger:
 
         fig, ax = plt.subplots(ny, nx, figsize=(x, y), constrained_layout=True)
 
+        if ny == 1 and nx == 1:
+            ax = np.array([[ax]])
+
         for j in range(ny):
             for i in range(nx):
                 k = i + nx * j
@@ -666,11 +673,11 @@ class Logger:
         # if "sigma" in self.args:
         #     self.args.prefix = self.args.prefix + ", s=" + str(self.args.sigma)
 
-        if "h_ub" in self.args:
-            self.args.prefix = self.args.prefix + ", h=" + str(self.args.h_ub)
+        # if "h_ub" in self.args:
+        #     self.args.prefix = self.args.prefix + ", h=" + str(self.args.h_ub)
 
-        if "sigma" in self.args:
-            self.args.prefix = self.args.prefix + ", s=" + str(self.args.sigma)
+        # if "sigma" in self.args:
+        #     self.args.prefix = self.args.prefix + ", s=" + str(self.args.sigma)
 
         # if "sigma_scale" in self.args:
         #     self.args.prefix = self.args.prefix + ", sc=" + str(self.args.sigma_scale)

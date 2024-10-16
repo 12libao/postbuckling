@@ -6,6 +6,9 @@ import time
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "utils"))
 
+import functools
+import platform
+
 import eigenvector_derivatives as eig_deriv
 from eigenvector_derivatives import (
     IRAM,
@@ -14,6 +17,7 @@ from eigenvector_derivatives import (
     eval_adjoint_residual_norm,
 )
 from icecream import ic
+from joblib import Parallel, delayed
 from matplotlib.animation import FuncAnimation
 import matplotlib.pylab as plt
 import matplotlib.pyplot as plt
@@ -25,6 +29,89 @@ from scipy.sparse import linalg
 
 from fe_utils import populate_Be_and_Te, populate_nonlinear_strain_and_Be
 from node_filter import NodeFilter
+
+# Add the build directory to sys.path if the library is located there
+build_dir = os.path.join(os.path.dirname(__file__), "build")
+sys.path.append(build_dir)
+
+import kokkos
+
+if platform.system() == "Darwin":
+    n_jobs = -1
+else:
+    n_jobs = 1
+
+
+# Define a global switch for progress printing
+PRINT_PROGRESS = True  # Set to False to disable progress printing
+# ANSI escape code for green text
+G = "\033[32m"
+E = "\033[0m"
+
+cw = plt.colormaps["coolwarm"]
+
+
+def _print_progress(i, n, t0, prefix="", suffix="", bar_length=20):
+    global PRINT_PROGRESS
+
+    if not PRINT_PROGRESS:
+        return
+
+    # Calculate elapsed time and time remaining
+    elapsed_time = time.time() - t0
+    avg_time_per_iter = elapsed_time / (i + 1)
+    tr = round(avg_time_per_iter * (n - i - 1))
+
+    # Format time remaining in minutes and seconds
+    if tr >= 60:
+        minutes, seconds = divmod(tr, 60)
+        t = f"{minutes}m {seconds}s"
+    else:
+        t = f"{tr}s"
+
+    # Calculate percentage progress and construct progress bar
+    percent = 100 * (i / (n - 1))  # Use n - 1 for zero-based indexing
+    filled_length = int(bar_length * i // (n - 1))
+    bar = "#" * filled_length + "-" * (bar_length - filled_length)
+
+    # Print progress without adding newlines, padding to ensure consistency
+    print(
+        f"\r{G}{prefix}{E} --> |{bar}| {percent:.1f}%, Remain time: {t} {suffix}",
+        end=" " * 2,
+    )
+
+    # Print newline only at the end when the iteration is complete
+    if i == n - 1:
+        # print(f"Total time: {G}{elapsed_time:.2f} s{E}")
+        print(
+            f"\r{G}{prefix}{E} --> |{bar}| {percent:.1f}%, Total time: {G}{elapsed_time:.2f} s{E}"
+        )
+
+
+# Timer decorator
+def timeit(print_time=True):
+    """
+    Decorator to measure execution time of a function.
+    """
+
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            t0 = time.time()
+            result = func(*args, **kwargs)  # Call the actual function
+            t1 = time.time()
+            elapsed_time = t1 - t0
+
+            if print_time:
+                print(
+                    f"{G}{func.__name__}{E} --> Total time: {G}{elapsed_time:.5f} s{E}"
+                )
+
+            return result
+
+        return wrapper
+
+    return decorator
 
 
 class TopologyAnalysis:
@@ -43,7 +130,7 @@ class TopologyAnalysis:
         ptype_G="simp",
         rho0_K=1e-6,
         rho0_M=1e-9,
-        rho0_G=1e-9,
+        rho0_G=1e-6,
         p=3.0,
         q=5.0,
         density=1.0,
@@ -92,34 +179,26 @@ class TopologyAnalysis:
         self.nnodes = int(np.max(self.conn)) + 1
         self.nvars = 2 * self.nnodes
 
-        print("nnodes", self.nnodes)
-
+        self.x = np.ones(self.fltr.num_design_vars)
+        self.xb = np.zeros(self.x.shape)
+        
         # # Set the initial design variable values
         # def _read_vtk(file, nx, ny):
         #     x, rho = [], []
-        #     nnodes = int((nx + 1) * (ny + 1))
-        #     ic(nx, ny, nnodes)
+        #     # nnodes = int((nx + 1) * (ny + 1))
+        #     ic(nx, ny, self.nnodes)
         #     with open(file) as f:
         #         for num, line in enumerate(f, 1):
         #             if "design" in line:
-        #                 x = np.loadtxt(file, skiprows=num + 1, max_rows=nnodes)
+        #                 x = np.loadtxt(file, skiprows=num + 1, max_rows=self.nnodes)
         #             if "rho" in line:
-        #                 rho = np.loadtxt(file, skiprows=num + 1, max_rows=nnodes)
+        #                 rho = np.loadtxt(file, skiprows=num + 1, max_rows=self.nnodes)
         #                 break
-
-        #     rho = rho.reshape((nx + 1, ny + 1))
-        #     x = x.reshape((nx + 1, ny + 1))
 
         #     return x, rho
 
-        # self.x, self.rho = _read_vtk("./output/it_1000.vtk", 200, 400)
-
-        # self.x = self.x.flatten()
-        # self.rho = self.rho.flatten()
-
-        self.x = np.ones(self.fltr.num_design_vars)
-        self.rho = self.fltr.apply(self.x)
-        self.xb = np.zeros(self.x.shape)
+        # self.x, self.rho = _read_vtk("./output/it_970.vtk", 300, 300)
+        ic(self.x.shape, self.nnodes, self.nelems)
 
         self.Q = None
         self.lam = None
@@ -157,6 +236,7 @@ class TopologyAnalysis:
         self.i = np.array(i, dtype=int)
         self.j = np.array(j, dtype=int)
 
+        self.intital_Be_and_Te()
         self._init_profile()
         return
 
@@ -205,10 +285,11 @@ class TopologyAnalysis:
 
         return bc_indices
 
-    def get_stiffness_matrix(self, rhoE):
+    def get_stiffness_matrix(self, rho):
         """
         Assemble the stiffness matrix
         """
+        rhoE = np.mean(rho[self.conn[:, :4]], axis=1)
 
         # Compute the element stiffnesses
         if self.ptype_K == "simp":
@@ -224,12 +305,95 @@ class TopologyAnalysis:
         for i in range(4):
             Be = self.Be[:, :, :, i]
             detJ = self.detJ[:, i]
-            Ke += detJ[:, np.newaxis, np.newaxis] * Be.transpose(0, 2, 1) @ C @ Be
+            Ke += detJ.reshape(-1, 1, 1) * Be.transpose(0, 2, 1) @ C @ Be
 
-        K = sparse.coo_matrix((Ke.flatten(), (self.i, self.j)))
-        K = K.tocsr()
-
+        K = sparse.csc_matrix((Ke.flatten(), (self.i, self.j)))  # column format
+        
         return K
+
+    def get_stress_stiffness_matrix(self, rho, u):
+        """
+        Assemble the stess stiffness matrix
+        """
+        # if any of rhoE or u1 is complex, set the dtype to complex
+        if np.iscomplexobj(rho) or np.iscomplexobj(u):
+            dt = complex
+        else:
+            dt = float
+
+        rhoE = np.mean(rho[self.conn[:, :4]], axis=1)
+        # Get the element-wise solution variables
+        ue = np.zeros((self.nelems, 8), dtype=dt)
+        ue[:, ::2] = u[2 * self.conn]
+        ue[:, 1::2] = u[2 * self.conn + 1]
+
+        # Compute the element stiffnesses
+        if self.ptype_G == "simp":
+            C = np.outer(rhoE**self.p + self.rho0_G, self.C0)
+        else:  # ramp
+            C = np.outer(rhoE / (1.0 + self.q * (1.0 - rhoE)) + self.rho0_G, self.C0)
+
+        C = C.reshape((self.nelems, 3, 3))
+
+        Ge = np.zeros((self.nelems, 8, 8), dtype=dt)
+
+        for i in range(4):
+            detJ = self.detJ[:, i]
+            Be = self.Be[:, :, :, i]
+            Te = self.Te[:, :, :, :, i]
+
+            # Compute the stresses in each element
+            CBe = C @ Be
+            s = np.einsum("nik,nk -> ni", CBe, ue)
+            G0e = detJ.reshape(-1, 1, 1) * np.einsum("ni,nijl -> njl", s, Te)
+
+            Ge[:, 0::2, 0::2] += G0e
+            Ge[:, 1::2, 1::2] += G0e
+
+        G = sparse.csc_matrix((Ge.flatten(), (self.i, self.j)))
+
+        return G
+
+    # def get_stiffness_matrix(self, rho):
+    #     """
+    #     Assemble the stiffness matrix
+    #     """
+
+    #     Ke = kokkos.assemble_stiffness_matrix(
+    #         rho,
+    #         self.detJ_kokkos,
+    #         self.Be_kokkos,
+    #         self.conn,
+    #         self.C0,
+    #         self.rho0_K,
+    #         self.ptype_K,
+    #         self.p,
+    #         self.q,
+    #     )
+    #     K = sparse.csc_matrix((Ke.flatten(), (self.i, self.j)))
+
+    #     return K
+
+    # def get_stress_stiffness_matrix(self, rho, u):
+    #     """
+    #     Assemble the stess stiffness matrix
+    #     """
+    #     Ge = kokkos.assemble_stress_stiffness(
+    #         rho,
+    #         u,
+    #         self.detJ_kokkos,
+    #         self.Be_kokkos,
+    #         self.Te_kokkos,
+    #         self.conn,
+    #         self.C0,
+    #         self.rho0_G,
+    #         self.ptype_K,
+    #         self.p,
+    #         self.q,
+    #     )
+    #     G = sparse.csc_matrix((Ge.flatten(), (self.i, self.j)))
+
+    #     return G
 
     def get_stiffness_matrix_deriv(self, rhoE, psi, u):
         """
@@ -253,16 +417,11 @@ class TopologyAnalysis:
             detJ = self.detJ[:, i]
 
             if psi.ndim == 1 and u.ndim == 1:
-                # se = np.einsum("nij,nj -> ni", Be, psie)
-                # te = np.einsum("nij,nj -> ni", Be, ue)
-                # dfdrhoE += detJ * np.einsum("ij,nj,ni -> n", self.C0, se, te)
+                se = np.einsum("nij,nj -> ni", Be, psie)
+                te = np.einsum("nij,nj -> ni", Be, ue)
 
-                for n in range(self.nelems):
-                    se = Be[n] @ psie[n]
-                    te = Be[n] @ ue[n]
-                    # dfdrhoE[n] += detJ[n] * np.dot(se, np.dot(self.C0, te))
-                    dfdrhoE[n] += detJ[n] * se.T @ self.C0 @ te
-                    # dfdrhoE[n] += detJ[n] * psie[n].T @ Be[n].T @ self.C0 @ Be[n] @ ue[n]
+                Cte = np.einsum("ij,nj -> ni", self.C0, te)
+                dfdrhoE += detJ * np.einsum("ni,ni -> n", se, Cte)
 
             elif psi.ndim == 2 and u.ndim == 2:
                 se = Be @ psie
@@ -279,131 +438,193 @@ class TopologyAnalysis:
             np.add.at(dKdrho, self.conn[:, i], dfdrhoE)
         dKdrho *= 0.25
 
-        return dKdrho
+        return self.fltr.apply_gradient(dKdrho, self.x)
 
-    def get_mass_matrix(self, rhoE):
+    def get_stress_stiffness_matrix_xuderiv(self, rhoE, u0, u, v):
+        dGdx = self.get_stress_stiffness_matrix_xderiv(rhoE, u0, u, v)
+        dGdu = self.get_stress_stiffness_matrix_uderiv(rhoE, u, v)
+        dGdur = self.reduce_vector(dGdu)
+        adjr = -self.Kfact(dGdur)
+        adj = self.full_vector(adjr)
+        dGdx += self.get_stiffness_matrix_deriv(rhoE, adj, u0)
+
+        return dGdx
+
+    def get_dK1dx(self, rhoE, u1, psi, u):
         """
-        Assemble the mass matrix
-        """
-
-        # Compute the element density
-        if self.ptype_M == "msimp":
-            nonlin = self.simp_c1 * rhoE**6.0 + self.simp_c2 * rhoE**7.0
-            cond = (rhoE > 0.1).astype(int)
-            density = self.density * (rhoE * cond + nonlin * (1 - cond))
-        elif self.ptype_M == "ramp":
-            density = self.density * (
-                (self.q + 1.0) * rhoE / (1 + self.q * rhoE) + self.rho0_M
-            )
-        else:  # linear
-            density = self.density * rhoE
-
-        # Assemble all of the the 8 x 8 element mass matrices
-        Me = np.zeros((self.nelems, 8, 8), dtype=rhoE.dtype)
-
-        for j in range(2):
-            for i in range(2):
-                detJ = self.detJ[:, 2 * j + i]
-                He = self.He[:, :, 2 * j + i]
-
-                # This is a fancy (and fast) way to compute the element matrices
-                Me += np.einsum("n,nij,nil -> njl", density * detJ, He, He)
-
-        M = sparse.coo_matrix((Me.flatten(), (self.i, self.j)))
-        M = M.tocsr()
-
-        return M
-
-    def get_mass_matrix_deriv(self, rhoE, u, v):
-        """
-        Compute the derivative of the mass matrix
+        Compute the derivative of the stiffness matrix times the vectors psi and u
         """
 
-        # Derivative with respect to element density
-        dfdrhoE = np.zeros(self.nelems)
+        df1drhoE = np.zeros(self.nelems)
+
+        u1 = u1 / np.linalg.norm(u1)
 
         # The element-wise variables
-        ue = np.zeros((self.nelems, 8) + u.shape[1:])
-        ve = np.zeros((self.nelems, 8) + v.shape[1:])
+        ue = np.zeros((self.nelems, 8), dtype=rhoE.dtype)
+        psie = np.zeros((self.nelems, 8), dtype=rhoE.dtype)
+        ue1 = np.zeros((self.nelems, 8), dtype=rhoE.dtype)
 
         ue[:, ::2, ...] = u[2 * self.conn, ...]
         ue[:, 1::2, ...] = u[2 * self.conn + 1, ...]
 
-        ve[:, ::2, ...] = v[2 * self.conn, ...]
-        ve[:, 1::2, ...] = v[2 * self.conn + 1, ...]
+        psie[:, ::2, ...] = psi[2 * self.conn, ...]
+        psie[:, 1::2, ...] = psi[2 * self.conn + 1, ...]
 
-        if u.ndim == 1 and v.ndim == 1:
-            for j in range(2):
-                for i in range(2):
-                    He = self.He[:, :, 2 * j + i]
-                    detJ = self.detJ[:, 2 * j + i]
-
-                    eu = np.einsum("nij,nj -> ni", He, ue)
-                    ev = np.einsum("nij,nj -> ni", He, ve)
-                    dfdrhoE += np.einsum("n,ni,ni -> n", detJ, eu, ev)
-        elif u.ndim == 2 and v.ndim == 2:
-            for j in range(2):
-                for i in range(2):
-                    He = self.He[:, :, 2 * j + i]
-                    detJ = self.detJ[:, 2 * j + i]
-
-                    eu = He @ ue
-                    ev = He @ ve
-                    dfdrhoE += detJ * np.einsum("nik,nik -> n", eu, ev)
-
-        if self.ptype_M == "msimp":
-            dnonlin = 6.0 * self.simp_c1 * rhoE**5.0 + 7.0 * self.simp_c2 * rhoE**6.0
-            cond = (rhoE > 0.1).astype(int)
-            dfdrhoE[:] *= self.density * (cond + dnonlin * (1 - cond))
-        elif self.ptype_M == "ramp":
-            dfdrhoE[:] *= self.density * (1.0 + self.q) / (1.0 + self.q * rhoE) ** 2
-        else:  # linear
-            dfdrhoE[:] *= self.density
-
-        dMdrho = np.zeros(self.nnodes)
+        ue1[:, ::2, ...] = u1[2 * self.conn, ...]
+        ue1[:, 1::2, ...] = u1[2 * self.conn + 1, ...]
 
         for i in range(4):
-            np.add.at(dMdrho, self.conn[:, i], dfdrhoE)
-        dMdrho *= 0.25
-
-        return dMdrho
-
-    def get_stress_stiffness_matrix(self, rhoE, u):
-        """
-        Assemble the stess stiffness matrix
-        """
-
-        # Get the element-wise solution variables
-        ue = np.zeros((self.nelems, 8), dtype=rhoE.dtype)
-        ue[:, ::2] = u[2 * self.conn]
-        ue[:, 1::2] = u[2 * self.conn + 1]
-
-        # Compute the element stiffnesses
-        if self.ptype_G == "simp":
-            C = np.outer(rhoE**self.p + self.rho0_G, self.C0)
-        else:  # ramp
-            C = np.outer(rhoE / (1.0 + self.q * (1.0 - rhoE)) + self.rho0_G, self.C0)
-
-        C = C.reshape((self.nelems, 3, 3))
-
-        Ge = np.zeros((self.nelems, 8, 8), dtype=rhoE.dtype)
-
-        for i in range(4):
-            detJ = self.detJ[:, i]
             Be = self.Be[:, :, :, i]
-            Te = self.Te[:, :, :, :, i]
+            detJ = self.detJ[:, i]
 
-            # Compute the stresses in each element
-            s = np.einsum("nij,njk,nk -> ni", C, Be, ue)
+            Be1 = np.zeros((self.nelems, 3, 8))
+            populate_nonlinear_strain_and_Be(Be, ue1, Be1)
 
-            G0e = np.einsum("n,ni,nijl -> njl", detJ, s, Te)
-            Ge[:, 0::2, 0::2] += G0e
-            Ge[:, 1::2, 1::2] += G0e
+            se = np.einsum("nij,nj -> ni", Be, psie)
+            te = np.einsum("nij,nj -> ni", Be1, ue)
 
-        G = sparse.coo_matrix((Ge.flatten(), (self.i, self.j)))
-        G = G.tocsr()
+            Cte = np.einsum("ij,nj -> ni", self.C0, te)
+            df1drhoE += detJ * np.einsum("ni,ni -> n", se, Cte)
 
-        return G
+        if self.ptype_K == "simp":
+            df1drhoE[:] *= self.p * rhoE ** (self.p - 1.0)
+        else:  # ramp
+            df1drhoE[:] *= (1.0 + self.q) / (1.0 + self.q * (1.0 - rhoE)) ** 2
+
+        dK1drho = np.zeros(self.nnodes)
+        for i in range(4):
+            np.add.at(dK1drho, self.conn[:, i], df1drhoE)
+        dK1drho *= 0.25
+
+        return self.fltr.apply_gradient(dK1drho, self.x)
+
+    def get_dK11dx(self, rhoE, u1, psi, u):
+        """
+        Compute the derivative of the stiffness matrix times the vectors psi and u
+        """
+
+        df11drhoE = np.zeros(self.nelems)
+
+        u1 = u1 / np.linalg.norm(u1)
+
+        # The element-wise variables
+        ue = np.zeros((self.nelems, 8), dtype=rhoE.dtype)
+        psie = np.zeros((self.nelems, 8), dtype=rhoE.dtype)
+        ue1 = np.zeros((self.nelems, 8), dtype=rhoE.dtype)
+
+        ue[:, ::2, ...] = u[2 * self.conn, ...]
+        ue[:, 1::2, ...] = u[2 * self.conn + 1, ...]
+
+        psie[:, ::2, ...] = psi[2 * self.conn, ...]
+        psie[:, 1::2, ...] = psi[2 * self.conn + 1, ...]
+
+        ue1[:, ::2, ...] = u1[2 * self.conn, ...]
+        ue1[:, 1::2, ...] = u1[2 * self.conn + 1, ...]
+
+        for i in range(4):
+            Be = self.Be[:, :, :, i]
+            detJ = self.detJ[:, i]
+
+            Be1 = np.zeros((self.nelems, 3, 8))
+            populate_nonlinear_strain_and_Be(Be, ue1, Be1)
+
+            se = np.einsum("nij,nj -> ni", Be1, psie)
+            te = np.einsum("nij,nj -> ni", Be1, ue)
+
+            Cte = np.einsum("ij,nj -> ni", self.C0, te)
+            df11drhoE += detJ * np.einsum("ni,ni -> n", se, Cte)
+
+        if self.ptype_K == "simp":
+            df11drhoE[:] *= self.p * rhoE ** (self.p - 1.0)
+        else:  # ramp
+            df11drhoE[:] *= (1.0 + self.q) / (1.0 + self.q * (1.0 - rhoE)) ** 2
+
+        dK11drho = np.zeros(self.nnodes)
+        for i in range(4):
+            np.add.at(dK11drho, self.conn[:, i], df11drhoE)
+        dK11drho *= 0.25
+
+        return self.fltr.apply_gradient(dK11drho, self.x)
+
+    def get_dK1dx_cd(self, x, dQdx, Q0, u, v, dh=1e-4):
+        """
+        Compute the derivative of the stiffness matrix times the vectors u and v using central differences
+        """
+
+        # Precompute detJ * Be terms outside the loop to avoid redundancy
+        detJBe = np.zeros((self.nelems, 8, 3, 4))
+        for i in range(4):
+            Be = self.Be[:, :, :, i]
+            detJ = self.detJ[:, i]
+            detJBe[:, :, :, i] = detJ.reshape(-1, 1, 1) * Be.transpose(0, 2, 1)
+
+        conn_indices = self.conn[:, :4]
+        dK1dx = np.zeros(self.nnodes)
+
+        t0 = time.time()
+        for n in range(x.size):
+            # Add a small perturbation to the design variable
+            x1, x2 = x.copy(), x.copy()
+            x1[n] += dh
+            x2[n] -= dh
+
+            # Apply filtering and compute average rhoE for both perturbed vectors
+            rhoE1 = np.mean(self.fltr.apply(x1)[conn_indices], axis=1)
+            rhoE2 = np.mean(self.fltr.apply(x2)[conn_indices], axis=1)
+
+            # Compute Q1 and Q2 using dQdx and normalize them
+            Q1 = dQdx @ (x1 - x) + Q0
+            Q2 = dQdx @ (x2 - x) + Q0
+
+            # Adjust the direction of Q1 and Q2 if necessary
+            Q1 = np.where(np.dot(Q0, Q1) < 0, -Q1, Q1)
+            Q2 = np.where(np.dot(Q0, Q2) < 0, -Q2, Q2)
+
+            # Normalize Q1 and Q2
+            Q1 /= np.linalg.norm(Q1)
+            Q2 /= np.linalg.norm(Q2)
+
+            ue1 = np.zeros((self.nelems, 8), dtype=rhoE1.dtype)
+            ue2 = np.zeros((self.nelems, 8), dtype=rhoE2.dtype)
+            ue1[:, ::2] = Q1[2 * self.conn]
+            ue1[:, 1::2] = Q1[2 * self.conn + 1]
+            ue2[:, ::2] = Q2[2 * self.conn]
+            ue2[:, 1::2] = Q2[2 * self.conn + 1]
+
+            # Compute the element stiffnesses
+            if self.ptype_K == "simp":
+                C1 = np.outer(rhoE1**self.p + self.rho0_K, self.C0)
+                C2 = np.outer(rhoE2**self.p + self.rho0_K, self.C0)
+            else:  # ramp
+                C1 = np.outer(
+                    rhoE1 / (1.0 + self.q * (1.0 - rhoE1)) + self.rho0_K, self.C0
+                )
+                C2 = np.outer(
+                    rhoE2 / (1.0 + self.q * (1.0 - rhoE2)) + self.rho0_K, self.C0
+                )
+
+            C1 = C1.reshape((self.nelems, 3, 3))
+            C2 = C2.reshape((self.nelems, 3, 3))
+
+            # Compute dKe and sum up contributions from all elements
+            dKe = np.zeros((self.nelems, 8, 8), dtype=rhoE1.dtype)
+            for i in range(4):
+                Be = self.Be[:, :, :, i]
+                detJBei = detJBe[:, :, :, i]
+
+                Be1 = np.zeros((self.nelems, 3, 8), dtype=rhoE1.dtype)
+                Be2 = np.zeros((self.nelems, 3, 8), dtype=rhoE2.dtype)
+                populate_nonlinear_strain_and_Be(Be, ue1, Be1)
+                populate_nonlinear_strain_and_Be(Be, ue2, Be2)
+
+                dKe += detJBei @ (C1 @ Be1 - C2 @ Be2)
+
+            dK = sparse.csc_matrix((dKe.flatten(), (self.i, self.j)))
+            dK1dx[n] = (u.T @ dK @ v) / (2 * dh)
+
+            _print_progress(n, self.nnodes, t0, "dK1/dx")
+
+        return dK1dx
 
     def setBCs(self, u):
         """
@@ -749,27 +970,40 @@ class TopologyAnalysis:
     def arc_length_method(
         self,
         Dl=1.0,
+        scale=1.0,
         u=None,
         tol=1e-12,
         maxiter=100,
         k_max=10,
         lmax=None,
         geteigval=False,
+        u_imp=None,
     ):
         if u is None:
             u = np.zeros(2 * self.nnodes)
 
-        # store the u and l with size (2*nnodes, n_max)
-        u_list = []
-        l_list = []
-        eig_Kt_list = []
+        if u_imp is not None:
+            self.X[:, 0] += u_imp[::2]
+            self.X[:, 1] += u_imp[1::2]
+            self.intital_Be_and_Te()
 
         self.setBCs(u)
         u_prev = u.copy()
         u_prev_prev = u.copy()
 
-        l, l_prev, l_prev_prev = Dl, 0.0, 0.0
-        Ds, Ds_prev, Ds_max, Ds_min = Dl, Dl, Dl, Dl / 1024
+        l, l_prev, l_prev_prev = Dl, 0, 0
+        Ds, Ds_prev, Ds_max, Ds_min = Dl, Dl, Dl / scale, Dl / 1024
+
+        u_list = [u_prev]
+        l_list = [l_prev]
+        eig_Kt_list = []
+        if geteigval:
+            Kt = self.getKt(self.rhoE, u)[1]
+            Ktr = self.reduce_matrix(Kt)
+            eig_Kt = sparse.linalg.eigsh(
+                Ktr, k=1, which="LM", return_eigenvectors=False, sigma=0.0
+            )
+            eig_Kt_list.append(eig_Kt)
 
         converged = False
         converged_prev = False
@@ -780,9 +1014,9 @@ class TopologyAnalysis:
         # arch-length algorithm
         for n in range(maxiter):
             if n > 0:
-                a = Ds / Ds_prev
-                u = (1 + a) * u_prev - a * u_prev_prev
-                l = (1 + a) * l_prev - a * l_prev_prev
+                a0 = Ds / Ds_prev
+                u = (1 + a0) * u_prev - a0 * u_prev_prev
+                l = (1 + a0) * l_prev - a0 * l_prev_prev
 
             Du = u - u_prev
             Dl = l - l_prev
@@ -836,7 +1070,7 @@ class TopologyAnalysis:
             if converged:
                 if n == 0:
                     Ds = np.sqrt(np.dot(Du.T, Du) + Dl**2 * ff)
-                    Ds_min, Ds_max = Ds / 1024, Ds
+                    Ds_min, Ds_max = Ds / 1024, Ds / scale
 
                 l_prev_prev = l_prev
                 l_prev = l
@@ -845,13 +1079,13 @@ class TopologyAnalysis:
                 Ds_prev = Ds
 
                 if converged_prev:
-                    Ds = min(max(2.0 * Ds, Ds_min), Ds_max)
+                    Ds = min(max(2 * Ds, Ds_min), Ds_max)
 
             else:
                 if converged_prev:
-                    Ds = max(Ds / 2, Ds_min)
+                    Ds = max(Ds / (2 * scale), Ds_min)
                 else:
-                    Ds = max(Ds / 4, Ds_min)
+                    Ds = max(Ds / (4 * scale), Ds_min)
 
             if lmax is not None and abs(l) > lmax:
                 break
@@ -866,59 +1100,102 @@ class TopologyAnalysis:
                 )
                 eig_Kt_list.append(eig_Kt)
 
+        if u_imp is not None:
+            self.X[:, 0] -= u_imp[::2]
+            self.X[:, 1] -= u_imp[1::2]
+            self.intital_Be_and_Te()
+
         if geteigval:
             return u_list, l_list, eig_Kt_list
         else:
             return u_list, l_list
 
-    def approximate_critical_load_factor(
-        self, sigma, lim=None, tol=1e-8, max_iter=100, eig_method=0
-    ):
+    def get_K1(self, rhoE, u1):
         """
-        Approximate the critical load factor using the Newton-Raphson method.
+        u1: the critical buckling mode (without normalization)
         """
-        # compute u1 at lam = 1.0
-        u1 = self.newton_raphson(1.0, tol=tol, max_iter=max_iter)
 
-        # compute K and G for u=u1
-        K_li, G_nl = self.getKt(self.rhoE, u1, return_G=True)
-
-        # Apply boundary conditions for K and G
-        Kr = self.reduce_matrix(K_li)
-        Gr = self.reduce_matrix(G_nl)
-
-        # compute the eigenvalues and eigenvectors
-        if eig_method == 1:
-            mu, u1 = sparse.linalg.eigsh(Gr, M=Kr, k=1, which="SM", igma=sigma)
-            lam_c = -1.0 / mu[0][0]
+        # if any of rhoE or u1 is complex, set the dtype to complex
+        if np.iscomplexobj(rhoE) or np.iscomplexobj(u1):
+            dt = complex
         else:
-            factor = SpLuOperator(Kr + sigma * Gr)
-            eig_solver = IRAM(N=1, m=2, mode="buckling", tol=tol)
-            lam_c, u1 = eig_solver.solve(Gr, Kr, factor, sigma)
+            dt = float
 
-        # bound the critical load factor by the limit
-        if lim is not None:
-            lam_c = np.clip(lam_c, 0.1 * lim, lim)
+        ue1 = np.zeros((self.nelems, 8), dtype=dt)
+        ue1[:, ::2] = u1[2 * self.conn]
+        ue1[:, 1::2] = u1[2 * self.conn + 1]
+
+        # Compute the element stiffnesses
+        if self.ptype_K == "simp":
+            C = np.outer(rhoE**self.p + self.rho0_K, self.C0)
+        else:  # ramp
+            C = np.outer(rhoE / (1.0 + self.q * (1.0 - rhoE)) + self.rho0_K, self.C0)
+
+        C = C.reshape((self.nelems, 3, 3))
+
+        Ke1 = np.zeros((self.nelems, 8, 8), dtype=dt)
+
+        for i in range(4):
+            detJ = self.detJ[:, i]
+            Be = self.Be[:, :, :, i]
+
+            Be1 = np.zeros((self.nelems, 3, 8), dtype=dt)
+            populate_nonlinear_strain_and_Be(Be, ue1, Be1)
+
+            CBe1 = C @ Be1
+            Ke1 += detJ.reshape(-1, 1, 1) * Be.transpose(0, 2, 1) @ CBe1
+
+        K1 = sparse.csc_matrix((Ke1.flatten(), (self.i, self.j)))
+
+        return K1
+
+    def get_K11(self, rhoE, u1):
+        """
+        u1: the critical buckling mode (without normalization)
+        """
+
+        # if any of rhoE or u1 is complex, set the dtype to complex
+        if np.iscomplexobj(rhoE) or np.iscomplexobj(u1):
+            dt = complex
         else:
-            lam_c = np.clip(lam_c, 0.1 * sigma, 1.1 * sigma)
+            dt = float
 
-        u1 = self.full_vector(u1[:, 0])
-        return lam_c[0], u1
+        ue1 = np.zeros((self.nelems, 8), dtype=dt)
+        ue1[:, ::2] = u1[2 * self.conn]
+        ue1[:, 1::2] = u1[2 * self.conn + 1]
 
-    def approximate_u1(self, lam_c):
-        print(f"Approximate u1 at lam = {lam_c}")
-        u = self.newton_raphson(lam_c)
-        # u = u / np.linalg.norm(u)
-        return u
+        # Compute the element stiffnesses
+        if self.ptype_K == "simp":
+            C = np.outer(rhoE**self.p + self.rho0_K, self.C0)
+        else:  # ramp
+            C = np.outer(rhoE / (1.0 + self.q * (1.0 - rhoE)) + self.rho0_K, self.C0)
 
-    def get_koiter_ab(self, rhoE, lam_c, u0, u1):
-        # normlize u1
-        u1 = u1 / np.linalg.norm(u1)
+        C = C.reshape((self.nelems, 3, 3))
 
-        # Get the element-wise solution variables
-        ue0 = np.zeros((self.nelems, 8), dtype=rhoE.dtype)
-        ue0[:, ::2] = u0[2 * self.conn]
-        ue0[:, 1::2] = u0[2 * self.conn + 1]
+        Ke11 = np.zeros((self.nelems, 8, 8), dtype=dt)
+
+        for i in range(4):
+            detJ = self.detJ[:, i]
+            Be = self.Be[:, :, :, i]
+
+            Be1 = np.zeros((self.nelems, 3, 8), dtype=dt)
+            populate_nonlinear_strain_and_Be(Be, ue1, Be1)
+
+            CBe1 = C @ Be1
+            Ke11 += detJ.reshape(-1, 1, 1) * Be1.transpose(0, 2, 1) @ CBe1
+
+        K11 = sparse.csc_matrix((Ke11.flatten(), (self.i, self.j)))
+
+        return K11
+
+    def get_G1(self, rhoE, u1, norm=True):
+        """
+        u1: the critical buckling mode (without normalization)
+        """
+        u1_norm = np.linalg.norm(u1)
+
+        if norm:
+            u1 = u1 / u1_norm
 
         ue1 = np.zeros((self.nelems, 8), dtype=rhoE.dtype)
         ue1[:, ::2, ...] = u1[2 * self.conn, ...]
@@ -927,29 +1204,121 @@ class TopologyAnalysis:
         # Compute the element stiffnesses
         if self.ptype_K == "simp":
             CK = np.outer(rhoE**self.p + self.rho0_K, self.C0)
-            CG = np.outer(rhoE**self.p + self.rho0_G, self.C0)
         else:  # ramp
             CK = np.outer(rhoE / (1.0 + self.q * (1.0 - rhoE)) + self.rho0_K, self.C0)
-            CG = np.outer(rhoE / (1.0 + self.q * (1.0 - rhoE)) + self.rho0_G, self.C0)
 
         CK = CK.reshape((self.nelems, 3, 3))
-        CG = CG.reshape((self.nelems, 3, 3))
 
-        Ke0 = np.zeros((self.nelems, 8, 8), dtype=rhoE.dtype)
-        Ke1 = np.zeros((self.nelems, 8, 8), dtype=rhoE.dtype)
-        Ke11 = np.zeros((self.nelems, 8, 8), dtype=rhoE.dtype)
-
-        Ge0 = np.zeros((self.nelems, 8, 8), dtype=rhoE.dtype)
         Ge1 = np.zeros((self.nelems, 8, 8), dtype=rhoE.dtype)
 
-        t0 = time.time()
         for i in range(4):
             detJ = self.detJ[:, i]
             Be = self.Be[:, :, :, i]
             Te = self.Te[:, :, :, :, i]
 
-            # strain_nl = np.zeros((self.nelems, 3))
-            Be1 = np.zeros((self.nelems, 3, 8))
+            CKBe = CK @ Be
+
+            s1 = np.einsum("nik,nk -> ni", CKBe, ue1)
+            G0e1 = np.einsum("n,ni,nijl -> njl", detJ, s1, Te)
+            Ge1[:, 0::2, 0::2] += G0e1
+            Ge1[:, 1::2, 1::2] += G0e1
+
+        # Create sparse matrices directly
+        G1 = sparse.csc_matrix((Ge1.flatten(), (self.i, self.j)))
+
+        return G1
+
+    def get_koiter_a(self, rhoE, u1, Q0_norm=None):
+        """
+        u1: the critical buckling mode (without normalization)
+        """
+        if Q0_norm is None:
+            Q0_norm = np.linalg.norm(u1)
+
+        u1 = u1 / Q0_norm
+
+        #  if any of rhoE or u1 is complex, set the dtype to complex
+        if np.iscomplexobj(rhoE) or np.iscomplexobj(u1):
+            dt = complex
+        else:
+            dt = float
+
+        ue1 = np.zeros((self.nelems, 8), dtype=dt)
+        ue1[:, ::2] = u1[2 * self.conn]
+        ue1[:, 1::2] = u1[2 * self.conn + 1]
+
+        # Compute the element stiffnesses
+        if self.ptype_K == "simp":
+            CK = np.outer(rhoE**self.p + self.rho0_K, self.C0)
+        else:  # ramp
+            CK = np.outer(rhoE / (1.0 + self.q * (1.0 - rhoE)) + self.rho0_K, self.C0)
+
+        CK = CK.reshape((self.nelems, 3, 3))
+        Ke1 = np.zeros((self.nelems, 8, 8), dtype=dt)
+
+        for i in range(4):
+            detJ = self.detJ[:, i]
+            Be = self.Be[:, :, :, i]
+
+            Be1 = np.zeros((self.nelems, 3, 8), dtype=dt)
+            populate_nonlinear_strain_and_Be(Be, ue1, Be1)
+
+            Ke1 += detJ.reshape(-1, 1, 1) * Be.transpose(0, 2, 1) @ CK @ Be1
+
+        # Create sparse matrices directly
+        self.K1 = sparse.csc_matrix((Ke1.flatten(), (self.i, self.j)))
+        K1r = self.reduce_matrix(self.K1)
+        u1r = self.reduce_vector(u1)
+
+        a = 1.5 * Q0_norm**2 * (u1r.T @ K1r @ u1r)
+
+        return a
+
+    def get_koiter_ab(self, rhoE, lam_c, u0, u1, Q0_norm=None, norm=True):
+        """
+        u1: the critical buckling mode (without normalization)
+        """
+        if Q0_norm is None:
+            Q0_norm = np.linalg.norm(u1)
+
+        if norm:
+            u1 = u1 / Q0_norm
+
+        # if any of rhoE or u1 is complex, set the dtype to complex
+        if np.iscomplexobj(rhoE) or np.iscomplexobj(u1):
+            dt = complex
+        else:
+            dt = float
+
+        ue0 = np.zeros((self.nelems, 8), dtype=dt)
+        ue1 = np.zeros((self.nelems, 8), dtype=dt)
+
+        ue0[:, ::2] = u0[2 * self.conn]
+        ue0[:, 1::2] = u0[2 * self.conn + 1]
+
+        ue1[:, ::2] = u1[2 * self.conn]
+        ue1[:, 1::2] = u1[2 * self.conn + 1]
+
+        # Compute the element stiffnesses
+        if self.ptype_K == "simp":
+            CK = np.outer(rhoE**self.p + self.rho0_K, self.C0)
+        else:  # ramp
+            CK = np.outer(rhoE / (1.0 + self.q * (1.0 - rhoE)) + self.rho0_K, self.C0)
+
+        CK = CK.reshape((self.nelems, 3, 3))
+
+        Ke0 = np.zeros((self.nelems, 8, 8), dtype=dt)
+        Ke1 = np.zeros((self.nelems, 8, 8), dtype=dt)
+        Ke11 = np.zeros((self.nelems, 8, 8), dtype=dt)
+        Ge0 = np.zeros((self.nelems, 8, 8), dtype=dt)
+        Ge1 = np.zeros((self.nelems, 8, 8), dtype=dt)
+
+        for i in range(4):
+            detJ = self.detJ[:, i]
+            Be = self.Be[:, :, :, i]
+            Te = self.Te[:, :, :, :, i]
+
+            Be1 = np.zeros((self.nelems, 3, 8), dtype=dt)
             populate_nonlinear_strain_and_Be(Be, ue1, Be1)
 
             CKBe = CK @ Be
@@ -959,23 +1328,15 @@ class TopologyAnalysis:
             Ke1 += detJ.reshape(-1, 1, 1) * Be.transpose(0, 2, 1) @ CKBe1
             Ke11 += detJ.reshape(-1, 1, 1) * Be1.transpose(0, 2, 1) @ CKBe1
 
-            # populate_nonlinear_strain_and_Be(Be, ue0, Be1, strain_nl)
-            s = np.einsum("nik,nk -> ni", CKBe, ue0)
-            # s = np.einsum("nij,njk,nk -> ni", CK, Be, ue0)
-            G0e = np.einsum("n,ni,nijl -> njl", detJ, s, Te)
-            Ge0[:, 0::2, 0::2] += G0e
-            Ge0[:, 1::2, 1::2] += G0e
+            s0 = np.einsum("nik,nk -> ni", CKBe, ue0)
+            G0e0 = np.einsum("n,ni,nijl -> njl", detJ, s0, Te)
+            Ge0[:, 0::2, 0::2] += G0e0
+            Ge0[:, 1::2, 1::2] += G0e0
 
-            # populate_nonlinear_strain_and_Be(Be, ue1, Be1, strain_nl)
-            # s1 = np.einsum("nij,nj -> ni", CG, strain_nl)
             s1 = np.einsum("nik,nk -> ni", CKBe, ue1)
-            # s1 = np.einsum("nij,njk,nk -> ni", CK, Be, ue1)
             G0e1 = np.einsum("n,ni,nijl -> njl", detJ, s1, Te)
             Ge1[:, 0::2, 0::2] += G0e1
             Ge1[:, 1::2, 1::2] += G0e1
-
-        t1 = time.time()
-        ic(t1 - t0)
 
         # Create sparse matrices directly
         K0 = sparse.csc_matrix((Ke0.flatten(), (self.i, self.j)))
@@ -986,186 +1347,1820 @@ class TopologyAnalysis:
 
         K0r = self.reduce_matrix(K0)
         K1r = self.reduce_matrix(K1)
+        K11r = self.reduce_matrix(K11)
         G0r = self.reduce_matrix(G0)
         G1r = self.reduce_matrix(G1)
         u1r = self.reduce_vector(u1)
 
         # Formulate block matrix directly using sparse operations
-        Ar = K0r + lam_c * G0r
-        L = (K0r @ u1r).reshape(-1, 1)  # SAME: L = (K1r @ u0r).reshape(-1, 1)
-        a = sparse.csc_matrix(([0], ([0], [0])), shape=(1, 1))
-        rhs = -(G1r + 0.5 * K1r) @ u1r
+        mu = -1.0 / lam_c
+        Ar = G0r - mu * K0r
+        Lr = (K0r @ u1r).reshape(-1, 1)  # SAME: L = (K1r @ u0r).reshape(-1, 1)
+        rhs = mu * (G1r + 0.5 * K1r) @ u1r
+        # nu = mu * u1r @ (0.5 * K1r + G1r) @ u1r * Q0_norm**2
+        # rhs2 = -nu * K0r @ u1r
+        # rhs = rhs1 + rhs2
+
+        # u2r = sparse.linalg.spsolve(Ar, rhs)
+        # u2 = self.full_vector(u2r)
+
+        # check if Ar is singular
+        # Ar = K0r + lam_c * G0r
+
+        # Ar = K0r + lam_c * G0r
+        # rhs = - (G1r + 0.5 * K1r) @ u1r
 
         # Construct the block matrix A in sparse format
-        A = sparse.bmat([[Ar, L], [L.T, a]], format="csc")
+        mat = sparse.bmat([[Ar, Lr], [Lr.T, [0]]], format="csc")
+
+        # if np.linalg.matrix_rank(Ar.toarray()) < Ar.shape[0]:
+        #     print("Ar is singular")
+        # else:
+        #     # check the condition number of Ar
+        #     c = np.linalg.cond(Ar.toarray())
+        #     print(f"Condition number of Ar: {c}")
+
+        #     c = np.linalg.cond(mat.toarray())
+        #     print(f"Condition number of mat: {c}")
+        #     print("Ar is not singular")
+        # exit()
 
         # Solve the linear system
-        x = sparse.linalg.spsolve(A, np.hstack([rhs, 0]))
+        self.matfactor = linalg.factorized(mat)
+        x = self.matfactor(np.hstack([rhs, 0]))
+
+        # x = sparse.linalg.spsolve(mat, np.hstack([rhs, 0]))
         u2 = self.full_vector(x[:-1])
+        u2r = self.reduce_vector(u2)
+        self.nu = x[-1]
 
-        ue2 = np.zeros((self.nelems, 8), dtype=rhoE.dtype)
-        ue2[:, ::2, ...] = u2[2 * self.conn, ...]
-        ue2[:, 1::2, ...] = u2[2 * self.conn + 1, ...]
+        a = 1.5 * Q0_norm**2 * (u1r.T @ K1r @ u1r)
+        b = Q0_norm**2 * (
+            u2r.T @ K1r @ u1r + 2 * u1r.T @ K1r @ u2r + 0.5 * u1r.T @ K11r @ u1r
+        )
 
-        # check if u1 orthogonal to u2
-        a22 = 0.0
-        b22 = 0.0
-        a11 = 0.0
-        b11 = 0.0
+        return a, b, u1, u2, K1, K11, G1
 
-        an = 0.0
-        bn = 0.0
-        d1 = 0.0
-        d2 = 0.0
+    def get_lam_s(self, lam_c, a, xi=1e-3):
+        # make sure a*xi < 0
+        if a * xi > 0:
+            xi = -xi
+
+        x = np.abs(a * xi)
+        lam_s = lam_c * (1 + 2 * x - 2 * np.sqrt(x**2 + x))
+
+        return lam_s
+
+    def get_ks_lams(self, a, xi=1e-3, ks_rho=160.0):
+        lams = self.get_lam_s(self.BLF, a, xi)
+        mu = 1 / lams
+        c = max(mu)
+        eta = np.exp(ks_rho * (mu-c))
+        ks_min = c + np.log(np.sum(eta)) / ks_rho    
+        return ks_min
+
+    def get_ks_lams_derivatives(self, a, dadx, xi=1e-3, ks_rho=160.0):
+        if a * xi > 0:
+            xi = -xi
+
+        x = np.abs(a * xi)
+        t0 = 1 + 2 * x - 2 * np.sqrt(x**2 + x)
+
+        time0 = time.time()
+        lams = self.BLF * t0
+        mu = 1 / lams
+        c = max(mu)
+        eta = np.exp(ks_rho * (mu - c))
+        eta = eta / np.sum(eta)
+
+        dfdrho = np.zeros(self.nnodes)
+        if self.deriv_type == "vector":
+            for i in range(self.N):
+                dKdx = self.get_stiffness_matrix_deriv(
+                    self.rhoE, self.Q[:, i], self.Q[:, i]
+                )
+                dGdx = self.get_stress_stiffness_matrix_xderiv(
+                    self.rhoE, self.u, self.Q[:, i], self.Q[:, i]
+                )
+
+                dGdu = self.get_stress_stiffness_matrix_uderiv(
+                    self.rhoE, self.Q[:, i], self.Q[:, i]
+                )
+                dGdur = self.reduce_vector(dGdu)
+                adjr = -self.Kfact(dGdur)
+                adj = self.full_vector(adjr)
+
+                dGdx += self.get_stiffness_matrix_deriv(self.rhoE, adj, self.u)
+                # dfdrho -= eta[i] * (dGdx + mu[i] * dKdx)
+                dldx = self.get_dldx(i)
+
+                t1 = self.BLF[i] * (2 - (2 * x + 1) / np.sqrt(x**2 + x))
+
+                dldx = self.BLF[i] * (dKdx + self.BLF[i] * dGdx)
+                dfdrho += eta[i] * (-1/lams[i]**2) * dldx * t0
+                dfdrho -= eta[i] * (-1/lams[i]**2) * dadx * xi * t1
+
+        elif self.deriv_type == "tensor":
+
+            eta_Q = (
+                -eta[:, np.newaxis]/lams[:, np.newaxis] ** 2
+                * self.BLF[:, np.newaxis]
+                * self.Q.T
+            ).T
+            eta_BLF_Q = (-eta[:, np.newaxis] /lams[:, np.newaxis] ** 2 * self.BLF[:, np.newaxis]**2 * self.Q.T).T
+
+            dKdx = self.get_stiffness_matrix_deriv(self.rhoE, eta_Q, self.Q)
+
+            dfds = self.intital_stress_stiffness_matrix_deriv(
+                self.rhoE, self.Te, self.detJ, eta_BLF_Q, self.Q
+            )
+            dGdu = self.get_stress_stiffness_matrix_uderiv_tensor(dfds, self.Be)
+            dGdur = self.reduce_vector(dGdu)
+            adjr = -self.Kfact(dGdur)
+            adj = self.full_vector(adjr)
+
+            dGdx = self.get_stress_stiffness_matrix_xderiv_tensor(
+                self.rhoE, self.u, dfds, self.Be
+            )
+            dGdx += self.get_stiffness_matrix_deriv(self.rhoE, adj, self.u)
+
+            dfdrho += (dGdx + dKdx) * t0
+
+            for i in range(self.N):
+                t1 = self.BLF[i] * (2 - (2 * x + 1) / np.sqrt(x**2 + x))
+                dfdrho += eta[i] / lams[i]**2 * dadx * xi * t1
+
+        time1 = time.time()
+        self.profile["total derivative time"] += time1 - time0
+
+        return dfdrho
+
+    def get_flam_s(self, lam_c, a, xi=1e-3):
+        return self.get_lam_s(lam_c, a, xi) / lam_c
+
+    def get_dlamsdx(self, lam_c, a, dldx, dadx, xi=1e-3):
+        if a * xi > 0:
+            xi = -xi
+
+        x = np.abs(a * xi)
+
+        t0 = 1 + 2 * x - 2 * np.sqrt(x**2 + x)
+        t1 = lam_c * (2 - (2 * x + 1) / np.sqrt(x**2 + x))
+
+        return t0 * dldx - t1 * dadx * xi
+
+    def get_dflamsdx(self, a, dadx, xi=1e-3):
+        if a * xi > 0:
+            xi = -xi
+
+        x = np.abs(a * xi)
+        tmp = 2 - (2 * x + 1) / np.sqrt(x**2 + x)
+        return -tmp * dadx * xi
+
+    def get_dldx(self, i=0):
+        """
+        d(lam)/dx = lam[0] * (dKdx + lam[0] * dGdx), where phi.T @ G @ phi = mu * I
+        """
+        u1 = self.Q[:, i]
+
+        dKdx = self.get_stiffness_matrix_deriv(self.rhoE, u1, u1)
+        dGdx = self.get_stress_stiffness_matrix_xuderiv(self.rhoE, self.u, u1, u1)
+
+        return self.lam[i] * (dKdx + self.lam[i] * dGdx)
+
+    def get_dQ0dx(self, dh=1e-4, p=None):
+        """
+        use central difference to compute du1/dx
+        """
+        # Use a random vector `p` if not provided
+        if p is None:
+            p = np.random.rand(self.x.size)
+            p = p / np.linalg.norm(p)
+
+        # Compute the perturbed design variables
+        x1 = self.x + dh * p
+        x2 = self.x - dh * p
+        rho1 = self.fltr.apply(x1)
+        rho2 = self.fltr.apply(x2)
+
+        # prepare the stiffness matrices K1 and K2
+        K1 = self.get_stiffness_matrix(rho1)
+        K2 = self.get_stiffness_matrix(rho2)
+        K1r = self.reduce_matrix(K1)
+        K2r = self.reduce_matrix(K2)
+
+        # solve for the solution path u01 and u02
+        K1fact = linalg.factorized(K1r)
+        K2fact = linalg.factorized(K2r)
+        u01r = K1fact(self.fr)
+        u02r = K2fact(self.fr)
+        u01 = self.full_vector(u01r)
+        u02 = self.full_vector(u02r)
+
+        # prepare the stress stiffness matrices G1 and G2
+        G1 = self.get_stress_stiffness_matrix(rho1, u01)
+        G2 = self.get_stress_stiffness_matrix(rho2, u02)
+        G1r = self.reduce_matrix(G1)
+        G2r = self.reduce_matrix(G2)
+
+        # solve the eigenvalue problem
+        mu01, phi01 = sparse.linalg.eigsh(
+            G1r, M=K1r, k=1, which="SM", sigma=self.lam[0]
+        )
+        mu02, phi02 = sparse.linalg.eigsh(
+            G2r, M=K2r, k=1, which="SM", sigma=self.lam[0]
+        )
+
+        self.phi01 = self.full_vector(phi01[:, 0])
+        self.phi02 = self.full_vector(phi02[:, 0])
+
+        # check if the two eigenvalues are same direction, if not flip the sign
+        if np.dot(self.phi01, self.phi02) < 0:
+            self.phi01 *= -1
+
+        du1dx = (self.phi01 - self.phi02) / (2 * dh)
+
+        return du1dx
+
+    def get_du1dx(self, dh=1e-4, p=None):
+        """
+        use central difference to compute du1/dx
+        """
+        self.get_dQ0dx(dh=dh, p=p)
+
+        phi01 = self.phi01 / np.linalg.norm(self.phi01)
+        phi02 = self.phi02 / np.linalg.norm(self.phi02)
+
+        du1dx = (phi01 - phi02) / (2 * dh)
+
+        return du1dx
+
+    def get_exact_dQ0dx(self, Q0):
+        """
+        Compute the exact derivative of Q0 with respect to the design variables
+        d(Q0)/dx = -1/2 (qi.T @ dKdx @ qi) * qi
+        d(Q0)/dx += sum_j_(j!=i) (qj @ (dGdx - mu[i]*dKdx) / (mu_0 - mu_i)) * qj
+        """
+        # compute the full size eigenvalue problem
+        mu, Qr = eigh(self.Gr.todense(), self.Kr.todense())
+        # Q0 = self.full_vector(Qr[:, 0])
+        # if np.dot(Q0, self.Q[:, 0]) < 0:
+        # Q0 *= -1
+
+        dKdx = self.get_stiffness_matrix_deriv(self.rhoE, Q0, Q0)
 
         t0 = time.time()
+        dQ0dx = -0.5 * np.outer(Q0, dKdx)
+        for i in range(1, Qr.shape[1]):
+            qi = self.full_vector(Qr[:, i])
+
+            dKdx = self.get_stiffness_matrix_deriv(self.rhoE, qi, Q0)
+            dGdx = self.get_stress_stiffness_matrix_xuderiv(self.rhoE, self.u, qi, Q0)
+
+            gx = (dGdx - mu[0] * dKdx) / (mu[0] - mu[i])
+            dQ0dx += np.outer(qi, gx)
+
+            _print_progress(i, Qr.shape[1], t0, "dQ0/dx")
+
+        return dQ0dx
+
+    def get_dG0dx_dK0dx_du0dx_cs(self, x, K, G, u0, Q0, dh=1e-30):
+        """
+        Compute the derivative of the stiffness matrix times the vectors u
+        """
+        # Preallocate memory for results before parallelization
+        ndv = x.size
+        dG0dx = np.zeros((2 * self.nnodes, ndv), dtype=x.dtype)
+        dK0dx = np.zeros((2 * self.nnodes, ndv), dtype=x.dtype)
+        du0dx = np.zeros((2 * self.nnodes, ndv), dtype=x.dtype)
+
+        def iterator(ii):
+            # Copy x and adjust the current index
+            x_cs = x.copy().astype(complex)
+            x_cs[ii] += dh * 1j
+
+            # Apply filter and compute stiffness matrix
+            rho = self.fltr.apply(x_cs)
+            K1 = self.get_stiffness_matrix(rho)
+
+            # Reduce and solve the system for the current perturbation
+            K1r = self.reduce_matrix(K1)
+            u1r = sparse.linalg.spsolve(K1r, self.fr)
+
+            # Remaining operations
+            u01 = self.full_vector(u1r)
+            G1 = self.get_stress_stiffness_matrix(rho, u01)
+
+            # Compute derivatives
+            dG0dx_n = (G1 - G).imag @ Q0 / dh
+            dK0dx_n = (K1 - K).imag @ Q0 / dh
+            du0dx_n = (u01 - u0).imag / dh
+
+            _print_progress(ii, self.nnodes, t0, "dQ0/dx")
+
+            return dG0dx_n, dK0dx_n, du0dx_n
+
+        t0 = time.time()
+
+        # Parallelize the loop
+        results = Parallel(n_jobs=n_jobs, prefer="threads")(
+            delayed(iterator)(ii) for ii in range(ndv)
+        )
+
+        # Unpack results efficiently
+        for n, (dG0dx_n, dK0dx_n, du0dx_n) in enumerate(results):
+            dG0dx[:, n] = dG0dx_n
+            dK0dx[:, n] = dK0dx_n
+            du0dx[:, n] = du0dx_n
+
+        return dK0dx, dG0dx, du0dx
+
+    @timeit(print_time=True)
+    def get_dQ0dx_dl0dx(self, x, K0, G0, dK0dx, dG0dx, l0, Q0):
+        """
+        Compute:
+            eigenvector derivatives dQ0/dx
+            eigenvalue derivative dl0/dx
+
+        An efficient algebraic method for the computation of natural frequency and mode shape sensitivities—Part I. Distinct natural frequencies - Lee, In-Won (1997)
+        https://www.sciencedirect.com/science/article/pii/S0045794996002064
+        """
+        mu = -1.0 / l0
+
+        # Apply filter and calculate rhoE only once
+        rhoE = np.mean(self.fltr.apply(x)[self.conn[:, :4]], axis=1)
+
+        # Construct the block matrix A in sparse format
+        A = G0 - mu * K0
+        L = (K0 @ Q0).reshape(-1, 1)
+        a = sparse.csc_matrix(([0], ([0], [0])), shape=(1, 1))
+
+        Ar = self.reduce_matrix(A)
+        Lr = self.reduce_vector(L)
+        mat = sparse.bmat([[Ar, -Lr], [-Lr.T, a]], format="csc")
+
+        # Construct the right-hand side
+        dKdx = self.get_stiffness_matrix_deriv(rhoE, Q0, Q0)
+
+        # dG0dx, dK0dx, du0dx = self.get_dG0dx_dK0dx_du0dx_cs(x, K0, G0, u0, Q0)
+        rhs1 = dG0dx - mu * dK0dx
+
+        rhs1r = np.array([self.reduce_vector(rhs1[:, i]) for i in range(self.nnodes)]).T
+        rhs = np.vstack([-rhs1r, 0.5 * dKdx.T])
+
+        # Solve the linear system
+        x = sparse.linalg.spsolve(mat, rhs)
+
+        # Reconstruct the eigenvector derivatives dQ0/dx and eigenvalue derivative dl0/dx
+        dQ0dx = np.array([self.full_vector(x[:-1, i]) for i in range(self.nnodes)]).T
+        dl0dx = l0**2 * x[-1]
+
+        return dQ0dx, dl0dx
+
+    def get_exact_du1dx(self, Q0):
+        """
+        Compute the exact derivative of Q0 with respect to the design variables
+        d(u1)/dx = 1/u1_norm * (d(Q0)/dx - 1/u1_norm**3 * Q0 * (Q0^T @ d(Q0)/dx))
+        """
+        du1dx = self.get_exact_dQ0dx()
+        u1_norm = np.linalg.norm(Q0)
+        du1dx_normalized = du1dx / u1_norm - np.outer(Q0, 1 / u1_norm**3 * Q0.T @ du1dx)
+
+        return du1dx_normalized
+
+    def get_dK1du(self, rhoE, u, v):
+        """
+        Compute: u^T @ d(K1)/du @ v   <-- which is a vector
+        """
+
+        # Get the element-wise solution variables
+        ue = np.zeros((self.nelems, 8), dtype=rhoE.dtype)
+        ue[:, ::2] = u[2 * self.conn]
+        ue[:, 1::2] = u[2 * self.conn + 1]
+
+        # Compute the element stiffnesses
+        if self.ptype_K == "simp":
+            CK = np.outer(rhoE**self.p + self.rho0_K, self.C0)
+        else:  # ramp
+            CK = np.outer(rhoE / (1.0 + self.q * (1.0 - rhoE)) + self.rho0_K, self.C0)
+
+        CK = CK.reshape((self.nelems, 3, 3))
+
+        Ge1 = np.zeros((self.nelems, 8, 8), dtype=rhoE.dtype)
+
         for i in range(4):
             detJ = self.detJ[:, i]
             Be = self.Be[:, :, :, i]
-            Be1 = np.zeros((self.nelems, 3, 8))
-            populate_nonlinear_strain_and_Be(Be, ue1, Be1)
+            Te = self.Te[:, :, :, :, i]
 
-            # strain_0 = np.einsum("nij,nj -> ni", Be, ue0)
-            strain_1 = np.einsum("nij,nj -> ni", Be, ue1)
-            strain_11 = np.einsum("nij,nj -> ni", Be1, ue1)
-            strain_12 = np.einsum("nij,nj -> ni", Be1, ue2)
-            strain_02 = np.einsum("nij,nj -> ni", Be, ue2)
+            CKBe = CK @ Be
+            s1 = np.einsum("nik,nk -> ni", CKBe, ue)
+            G0e1 = detJ.reshape(-1, 1, 1) * np.einsum("ni,nijl -> njl", s1, Te)
+            Ge1[:, 0::2, 0::2] += G0e1
+            Ge1[:, 1::2, 1::2] += G0e1
 
-            # stress_0 = np.einsum("nij,nj -> ni", CK, strain_0)
-            stress_1 = np.einsum("nij,nj -> ni", CK, strain_1)
-            stress_2 = np.einsum("nij,nj -> ni", CK, (strain_02 + 0.5 * strain_11))
+        dKdu = sparse.csc_matrix((Ge1.flatten(), (self.i, self.j)))
 
-            an += np.einsum("ni,ni -> n", stress_1, strain_11)
-            b1 = np.einsum("ni,ni -> n", stress_2, strain_11)
-            b2 = np.einsum("ni,ni -> n", stress_1, strain_12)
-            bn += b1 + 2 * b2
-            d2 += np.einsum("ni,ni -> n", stress_1, strain_1)
+        return dKdu @ v
 
-        an = np.sum(an)
-        bn = np.sum(bn)
-        # d1 = np.sum(d1)
-        d2 = np.sum(d2)
+    @timeit(print_time=True)
+    def get_dK1dQ0_cs(self, rhoE, K1, Q, u, v, dh=1e-20):
 
-        # a11 = 1.5 * an / d1
-        a22 = 1.5 * an / d2
+        dK1dQ0 = np.zeros(2 * self.nnodes)
 
-        # b11 = bn / d1
-        b22 = bn / d2
-        t1 = time.time()
-        ic(t1 - t0)
+        for i in range(2 * self.nnodes):
+            Q1 = Q.copy().astype(complex)
+            Q1[i] += 1j * dh
 
-        ic(a11, a22)
-        ic(b11, b22)
+            self.get_koiter_a(rhoE, Q1)
+            dK1dQ0[i] = (u.T @ (self.K1 - K1) @ v).imag / dh
 
-        a = a11
-        b = b11
+        return dK1dQ0
+
+    @timeit(print_time=True)
+    def get_dK11du1_cs(self, rhoE, K11, Q, u, v, dh=1e-30):
+
+        dK1du1 = np.zeros(2 * self.nnodes)
+        Q_norm = np.linalg.norm(Q)
+        u1 = Q / Q_norm
+
+        for i in range(2 * self.nnodes):
+            u1_1 = u1.copy().astype(complex)
+            u1_1[i] += 1j * dh
+
+            K11_1 = self.get_K11(rhoE, u1_1)
+            dK1du1[i] = (u.T @ (K11_1 - K11) @ v).imag / dh
+
+        return dK1du1
+
+    @timeit(print_time=True)
+    def get_dK1dQ0_cd(self, rhoE, Q, u, v, dh=1e-4):
+
+        dK1du1 = np.zeros(2 * self.nnodes)
+
+        Q_norm = np.linalg.norm(Q)
+        u1 = Q / Q_norm
+
+        # Compute the element stiffnesses
+        if self.ptype_K == "simp":
+            C = np.outer(rhoE**self.p + self.rho0_K, self.C0)
+        else:  # ramp
+            C = np.outer(rhoE / (1.0 + self.q * (1.0 - rhoE)) + self.rho0_K, self.C0)
+
+        C = C.reshape((self.nelems, 3, 3))
+
+        for i in range(2 * self.nnodes):
+            u1_1 = u1.copy()
+            u1_2 = u1.copy()
+
+            u1_1[i] += dh
+            u1_2[i] -= dh
+
+            # u1_1_norm = np.linalg.norm(u1_1)
+            # u1_2_norm = np.linalg.norm(u1_2)
+
+            # u1_1 = u1_1 / np.linalg.norm(u1_1)
+            # u1_2 = u1_2 / np.linalg.norm(u1_2)
+
+            ue1 = np.zeros((self.nelems, 8))
+            ue2 = np.zeros((self.nelems, 8))
+            ue1[:, ::2] = u1_1[2 * self.conn]
+            ue1[:, 1::2] = u1_1[2 * self.conn + 1]
+            ue2[:, ::2] = u1_2[2 * self.conn]
+            ue2[:, 1::2] = u1_2[2 * self.conn + 1]
+
+            dKe1 = np.zeros((self.nelems, 8, 8))
+
+            for j in range(4):
+                detJ = self.detJ[:, j]
+                Be = self.Be[:, :, :, j]
+
+                Be1 = np.zeros((self.nelems, 3, 8))
+                Be2 = np.zeros((self.nelems, 3, 8))
+                populate_nonlinear_strain_and_Be(Be, ue1, Be1)
+                populate_nonlinear_strain_and_Be(Be, ue2, Be2)
+
+                dCBe = C @ (Be1 - Be2)
+                dKe1 += detJ.reshape(-1, 1, 1) * Be.transpose(0, 2, 1) @ dCBe
+
+            dK1 = sparse.csc_matrix((dKe1.flatten(), (self.i, self.j)))
+            # dK1du1[i] = (u.T @ dK1 @ v) / (dh / u1_1_norm + dh / u1_2_norm)
+            dK1du1[i] = (u.T @ dK1 @ v) / (2 * dh)
+
+        return dK1du1 / Q_norm
+
+        # for i in range(2 * self.nnodes):
+        #     Q1 = Q.copy()
+        #     Q2 = Q.copy()
+        #     Q1[i] += dh * np.linalg.norm(Q)
+        #     Q2[i] -= dh * np.linalg.norm(Q)
+
+        #     self.get_koiter_a(rhoE, Q1)
+        #     K1_1 = self.K1
+        #     self.get_koiter_a(rhoE, Q2)
+        #     K1_2 = self.K1
+        #     dK1du1[i] = (u.T @ (K1_1 - K1_2) @ v) / (2 * dh)
+
+        # return dK1du1 / np.linalg.norm(Q)
+
+    @timeit(print_time=True)
+    def get_dK11du1_cd(self, rhoE, Q, u, v, dh=1e-4):
+
+        dK11du1 = np.zeros(2 * self.nnodes)
+
+        Q_norm = np.linalg.norm(Q)
+        u1 = Q / Q_norm
+
+        # Compute the element stiffnesses
+        if self.ptype_K == "simp":
+            C = np.outer(rhoE**self.p + self.rho0_K, self.C0)
+        else:  # ramp
+            C = np.outer(rhoE / (1.0 + self.q * (1.0 - rhoE)) + self.rho0_K, self.C0)
+
+        C = C.reshape((self.nelems, 3, 3))
+
+        for i in range(2 * self.nnodes):
+            u1_1 = u1.copy()
+            u1_2 = u1.copy()
+
+            u1_1[i] += dh
+            u1_2[i] -= dh
+
+            ue1 = np.zeros((self.nelems, 8))
+            ue2 = np.zeros((self.nelems, 8))
+            ue1[:, ::2] = u1_1[2 * self.conn]
+            ue1[:, 1::2] = u1_1[2 * self.conn + 1]
+            ue2[:, ::2] = u1_2[2 * self.conn]
+            ue2[:, 1::2] = u1_2[2 * self.conn + 1]
+
+            dKe11 = np.zeros((self.nelems, 8, 8))
+
+            for j in range(4):
+                detJ = self.detJ[:, j]
+                Be = self.Be[:, :, :, j]
+
+                Be1 = np.zeros((self.nelems, 3, 8))
+                Be2 = np.zeros((self.nelems, 3, 8))
+                populate_nonlinear_strain_and_Be(Be, ue1, Be1)
+                populate_nonlinear_strain_and_Be(Be, ue2, Be2)
+
+                BeCBe1 = Be1.transpose(0, 2, 1) @ C @ Be1
+                BeCBe2 = Be2.transpose(0, 2, 1) @ C @ Be2
+                dKe11 += detJ.reshape(-1, 1, 1) * (BeCBe1 - BeCBe2)
+
+            dK11 = sparse.csc_matrix((dKe11.flatten(), (self.i, self.j)))
+            dK11du1[i] = (u.T @ dK11 @ v) / (2 * dh)
+
+            # K11_1 = self.get_K11(rhoE, u1_1)
+            # K11_2 = self.get_K11(rhoE, u1_2)
+            # dK11du1[i] = (u.T @ (K11_1 - K11_2) @ v) / (2 * dh)
+
+        return dK11du1
+
+    def get_dadQ0_cd(self, rhoE, Q, dh=1e-4):
+
+        dadQ0 = np.zeros(2 * self.nnodes)
+
+        for i in range(2 * self.nnodes):
+            Q_1 = Q.copy()
+            Q_2 = Q.copy()
+            Q_1[i] += dh
+            Q_2[i] -= dh
+
+            a1 = self.get_koiter_a(rhoE, Q_1)
+            a2 = self.get_koiter_a(rhoE, Q_2)
+
+            dadQ0[i] = (a1 - a2) / (2 * dh)
+
+        return dadQ0
+
+    @timeit(print_time=True)
+    def get_dbdu1_cs(self, rhoE, lam_c, Q0, dh=1e-30):
+
+        Q0_norm = np.linalg.norm(Q0)
+        u1 = Q0 / Q0_norm
+
+        dbdu1 = np.zeros(2 * self.nnodes)
+
+        for i in range(2 * self.nnodes):
+            u1_1 = u1.copy().astype(complex)
+            u1_1[i] += 1j * dh
+
+            K1 = self.get_K1(rhoE, u1_1)
+            K11 = self.get_K11(rhoE, u1_1)
+            b1 = Q0_norm**2 * (
+                self.u2 @ K1 @ u1_1 + 0.5 * u1_1 @ K11 @ u1_1 + 2 * u1_1 @ K1 @ self.u2
+            )
+
+            dbdu1[i] = (b1 - self.b).imag / dh
+
+        return dbdu1
+
+    def get_dbdu1_cd(self, rhoE, lam_c, Q0, dh=1e-6):
+
+        Q0_norm = np.linalg.norm(Q0)
+        u1 = Q0 / Q0_norm
+
+        dbdu1 = np.zeros(2 * self.nnodes)
+
+        for i in range(2 * self.nnodes):
+            u1_1 = u1.copy()
+            u1_2 = u1.copy()
+            u1_1[i] += dh
+            u1_2[i] -= dh
+
+            K1_1 = self.get_K1(rhoE, u1_1)
+            K11_1 = self.get_K11(rhoE, u1_1)
+            b1 = Q0_norm**2 * (
+                self.u2 @ K1_1 @ u1_1
+                + 0.5 * u1_1 @ K11_1 @ u1_1
+                + 2 * u1_1 @ K1_1 @ self.u2
+            )
+
+            K1_2 = self.get_K1(rhoE, u1_2)
+            K11_2 = self.get_K11(rhoE, u1_2)
+            b2 = Q0_norm**2 * (
+                self.u2 @ K1_2 @ u1_2
+                + 0.5 * u1_2 @ K11_2 @ u1_2
+                + 2 * u1_2 @ K1_2 @ self.u2
+            )
+
+            dbdu1[i] = (b1 - b2) / (2 * dh)
+
+        return dbdu1
+
+    def get_dbdu2_cs(self, rhoE, lam_c, Q0, dh=1e-30):
+
+        Q0_norm = np.linalg.norm(Q0)
+        u1 = Q0 / Q0_norm
+
+        dbdu2 = np.zeros(2 * self.nnodes)
+
+        for i in range(2 * self.nnodes):
+            u2_1 = self.u2.copy().astype(complex)
+            u2_1[i] += 1j * dh
+
+            b1 = Q0_norm**2 * (
+                u2_1 @ self.K1 @ self.u1
+                + 0.5 * self.u1 @ self.K11 @ self.u1
+                + 2 * self.u1 @ self.K1 @ u2_1
+            )
+
+            dbdu2[i] = (b1 - self.b).imag / dh
+
+        return dbdu2
+
+    def get_papx_cs(self, x, a, Q, dh=1e-30):
+
+        papx = np.zeros(self.nnodes)
+
+        for i in range(self.nnodes):
+            x1 = x.copy().astype(complex)
+            x1[i] += 1j * dh
+
+            rhoE1 = np.mean(self.fltr.apply(x1)[self.conn[:, :4]], axis=1)
+            a1 = self.get_koiter_a(rhoE1, Q)
+            papx[i] = (a1 - a).imag / dh
+
+        return papx
+
+    @timeit(print_time=True)
+    def get_pbpx_cs(self, x, lam_c, Q, dh=1e-30):
+
+        pbpx = np.zeros(self.nnodes)
+
+        for i in range(self.nnodes):
+            x1 = x.copy().astype(complex)
+            x1[i] += 1j * dh
+
+            rhoE1 = np.mean(self.fltr.apply(x1)[self.conn[:, :4]], axis=1)
+            # b1 = self.get_koiter_ab(rhoE1, lam_c, Q)[1]--> which is wrong u2 is changed
+            _, _, _, _, K1, K11, G1 = self.get_koiter_ab(rhoE1, lam_c, Q)
+            b1 = np.linalg.norm(Q) ** 2 * (
+                self.u2 @ K1 @ self.u1
+                + 0.5 * self.u1 @ K11 @ self.u1
+                + 2 * self.u1 @ K1 @ self.u2
+            )
+            pbpx[i] = (b1 - self.b).imag / dh
+
+        return pbpx
+
+    @timeit(print_time=True)
+    def get_pbpx_cd(self, x, lam_c, Q, dh=1e-4):
+
+        pbpx = np.zeros(self.nnodes)
+
+        for i in range(self.nnodes):
+            x1 = x.copy()
+            x2 = x.copy()
+            x1[i] += dh
+            x2[i] -= dh
+
+            rhoE1 = np.mean(self.fltr.apply(x1)[self.conn[:, :4]], axis=1)
+            rhoE2 = np.mean(self.fltr.apply(x2)[self.conn[:, :4]], axis=1)
+            b1 = self.get_koiter_ab(rhoE1, lam_c, self.u, Q)[1]
+            b2 = self.get_koiter_ab(rhoE2, lam_c, self.u, Q)[1]
+
+            pbpx[i] = (b1 - b2) / (2 * dh)
+
+        return pbpx
+
+    def get_dK11dx_cs(self, x, rhoE, u1, u, v, dh=1e-30):
+
+        dK11dx = np.zeros(x.size)
+
+        for i in range(x.size):
+            x1 = x.copy().astype(complex)
+            x1[i] += 1j * dh
+
+            rhoE1 = np.mean(self.fltr.apply(x1)[self.conn[:, :4]], axis=1)
+            K11_1 = self.get_K11(rhoE1, u1)
+            dK11dx[i] = (u @ (K11_1 - self.K11) @ v).imag / dh
+
+        return dK11dx
+
+    def get_dG1dx_cs(self, x, rhoE, u1, u, v, dh=1e-30):
+
+        dG1dx = np.zeros(x.size)
+
+        for i in range(x.size):
+            x1 = x.copy().astype(complex)
+            x1[i] += 1j * dh
+
+            rhoE1 = np.mean(self.fltr.apply(x1)[self.conn[:, :4]], axis=1)
+            G1_1 = self.get_G1(rhoE1, u1)
+            dG1dx[i] = (u @ (G1_1 - self.G1) @ v).imag / dh
+
+        return dG1dx
+
+    def get_dG1dx_cd(self, x, rhoE, u1, u, v, dh=1e-4):
+
+        dG1dx = np.zeros(x.size)
+
+        for i in range(x.size):
+            x1 = x.copy()
+            x2 = x.copy()
+            x1[i] += dh
+            x2[i] -= dh
+
+            rhoE1 = np.mean(self.fltr.apply(x1)[self.conn[:, :4]], axis=1)
+            rhoE2 = np.mean(self.fltr.apply(x2)[self.conn[:, :4]], axis=1)
+            G1_1 = self.get_G1(rhoE1, u1)
+            G1_2 = self.get_G1(rhoE2, u1)
+            dG1dx[i] = (u @ (G1_1 - G1_2) @ v) / (2 * dh)
+
+        return dG1dx
+
+    def get_dadx_dbdx_cd(self, x, du0dx, dl0dx, dQ0dx, u0, l0, Q0, dh=1e-4):
+        """
+        Compute the derivative of the stiffness matrix times the vectors u
+        """
         t0 = time.time()
+
+        conn_indices = self.conn[:, :4]
+        Q0_norm = np.linalg.norm(Q0)
+        u1 = Q0 / Q0_norm
+
+        dadx = np.zeros(x.size)
+        dbdx = np.zeros(x.size)
+
+        for i in range(self.nnodes):
+            x1 = x.copy()
+            x2 = x.copy()
+
+            x1[i] += dh
+            x2[i] -= dh
+
+            rhoE1 = np.mean(self.fltr.apply(x1)[conn_indices], axis=1)
+            rhoE2 = np.mean(self.fltr.apply(x2)[conn_indices], axis=1)
+
+            l0_1 = l0 + dl0dx[i] * dh
+            l0_2 = l0 - dl0dx[i] * dh
+
+            u0_1 = u0 + du0dx[:, i] * dh
+            u0_2 = u0 - du0dx[:, i] * dh
+
+            u1_1 = u1 + dQ0dx[:, i] * dh / Q0_norm
+            u1_2 = u1 - dQ0dx[:, i] * dh / Q0_norm
+
+            a1, b1 = self.get_koiter_ab(rhoE1, l0_1, u0_1, u1_1, Q0_norm, False)[0:2]
+            a2, b2 = self.get_koiter_ab(rhoE2, l0_2, u0_2, u1_2, Q0_norm, False)[0:2]
+
+            dadx[i] = (a1 - a2) / (2 * dh)
+            dbdx[i] = (b1 - b2) / (2 * dh)
+
+            _print_progress(i, x.size, t0, "da/dx")
+
+        return dadx, dbdx
+
+    def get_dadx_dbdx_cs(self, x, du0dx, dl0dx, dQ0dx, u0, l0, Q0, dh=1e-30):
+
+        dadx = np.zeros(x.size)
+        dbdx = np.zeros(x.size)
+
+        t0 = time.time()
+
+        conn_indices = self.conn[:, :4]
+        Q0_norm = np.linalg.norm(Q0)
+        u1 = Q0 / Q0_norm
+
+        for i in range(self.nnodes):
+            x1 = x.copy().astype(complex)
+            x1[i] += 1j * dh
+
+            rhoE1 = np.mean(self.fltr.apply(x1)[conn_indices], axis=1)
+            l0_1 = l0 + dl0dx[i] * 1j * dh
+            Q0_1 = Q0 + dQ0dx[:, i] * 1j * dh
+            u0_1 = u0 + du0dx[:, i] * 1j * dh
+
+            a1, b1 = self.get_koiter_ab(rhoE1, l0_1, u0_1, Q0_1, Q0_norm)[0:2]
+
+            dadx[i] = (a1 - self.a).imag / dh
+            dbdx[i] = (b1 - self.b).imag / dh
+
+            _print_progress(i, x.size, t0, "da/dx")
+
+        return dadx, dbdx
+
+        # dadx = np.zeros(x.size)
+
+        # def iterator(n):
+        #     x1 = x.copy()
+        #     x2 = x.copy()
+
+        #     x1[n] += dh
+        #     x2[n] -= dh
+
+        #     dxi = 2 * dh
+        #     dQ0 = dQ0dx[:, n] * dxi
+
+        #     # Apply filtering and compute average rhoE for both perturbed vectors
+        #     rhoE1 = np.mean(self.fltr.apply(x1)[conn_indices], axis=1)
+        #     rhoE2 = np.mean(self.fltr.apply(x2)[conn_indices], axis=1)
+
+        #     u1 = Q0 / np.linalg.norm(Q0)
+        #     u1_1 = u1 + dQ0dx[:, n] * dh / np.linalg.norm(Q0)
+        #     u1_2 = u1 - dQ0dx[:, n] * dh / np.linalg.norm(Q0)
+
+        #     # Q0_1 = Q0 + dQ0dx[:, n] * dh
+        #     # Q0_2 = Q0 - dQ0dx[:, n] * dh
+
+        #     # # Normalize Q1 and Q2
+        #     # u1_1_norm = np.linalg.norm(Q0_1)
+        #     # u1_2_norm = np.linalg.norm(Q0_2)
+        #     # u1_1 = Q0_1 / u1_1_norm
+        #     # u1_2 = Q0_2 / u1_2_norm
+
+        #     ue1_1 = np.zeros((self.nelems, 8), dtype=rhoE1.dtype)
+        #     ue1_2 = np.zeros((self.nelems, 8), dtype=rhoE2.dtype)
+        #     ue1_1[:, ::2] = u1_1[2 * self.conn]
+        #     ue1_1[:, 1::2] = u1_1[2 * self.conn + 1]
+        #     ue1_2[:, ::2] = u1_2[2 * self.conn]
+        #     ue1_2[:, 1::2] = u1_2[2 * self.conn + 1]
+
+        #     # Compute the element stiffnesses
+        #     if self.ptype_K == "simp":
+        #         C1 = np.outer(rhoE1**self.p + self.rho0_K, self.C0)
+        #         C2 = np.outer(rhoE2**self.p + self.rho0_K, self.C0)
+        #     else:  # ramp
+        #         C1 = np.outer(
+        #             rhoE1 / (1.0 + self.q * (1.0 - rhoE1)) + self.rho0_K, self.C0
+        #         )
+        #         C2 = np.outer(
+        #             rhoE2 / (1.0 + self.q * (1.0 - rhoE2)) + self.rho0_K, self.C0
+        #         )
+
+        #     C1 = C1.reshape((self.nelems, 3, 3))
+        #     C2 = C2.reshape((self.nelems, 3, 3))
+        #     dKe1 = np.zeros((self.nelems, 8, 8), dtype=rhoE1.dtype)
+
+        #     for i in range(4):
+        #         detJ = self.detJ[:, i]
+        #         Be = self.Be[:, :, :, i]
+
+        #         Be1_1 = np.zeros((self.nelems, 3, 8), dtype=rhoE1.dtype)
+        #         Be1_2 = np.zeros((self.nelems, 3, 8), dtype=rhoE2.dtype)
+
+        #         populate_nonlinear_strain_and_Be(Be, ue1_1, Be1_1)
+        #         populate_nonlinear_strain_and_Be(Be, ue1_2, Be1_2)
+
+        #         dCKBe1 = C1 @ Be1_1 - C2 @ Be1_2
+        #         dKe1 += detJ.reshape(-1, 1, 1) * Be.transpose(0, 2, 1) @ dCKBe1
+
+        #     dK1 = sparse.csc_matrix((dKe1.flatten(), (self.i, self.j)))
+
+        #     dadxi = 1.5 * (Q0.T @ dK1 + dQ0.T @ (K1 + K1.T)) @ Q0 / dxi
+
+        #     _print_progress(n, self.nnodes, t0, "da/dx")
+
+        #     return dadxi
+
+        # results = Parallel(n_jobs=n_jobs, prefer="threads")(
+        #     delayed(iterator)(n) for n in range(x.size)
+        # )
+
+        # for n, dadxi in enumerate(results):
+        #     dadx[n] = dadxi
+
+        return dadx
+
+    def get_dadx(self, rhoE, l0, Q0):
+        Q0_norm = np.linalg.norm(Q0)
+        Q0r = self.reduce_vector(Q0)
+        K1r = self.reduce_matrix(self.K1)
+
+        # Ar = self.Gr + self.Kr / l0
+        # Lr = (self.Kr @ Q0r).reshape(-1, 1)
+        # mat = sparse.bmat([[Ar, -Lr], [-Lr.T, [0]]], format="csc")
+
+        # dK1dQ0_cd = self.get_dK1dQ0_cd(rhoE, Q0, Q0, Q0)
+        # dK1dQ0_cd = self.reduce_vector(dK1dQ0_cd)
+
+        # dK1dQ0_cs = self.get_dK1dQ0_cs(rhoE, K1, Q0, Q0, Q0)
+        # dK1dQ0_cs = self.reduce_vector(dK1dQ0_cs)
+
+        Qb = Q0r @ (K1r.T + 2 * K1r)
+        rhs = np.hstack([Qb, 0])
+        psi = self.matfactor(-1.5 * rhs)
+        # psi = sparse.linalg.spsolve(mat, -1.5 * rhs)
+
+        psi0 = self.full_vector(psi[:-1])
+        psi1 = -psi[-1] / Q0_norm
+
+        dGdx1 = self.get_stress_stiffness_matrix_xuderiv(rhoE, self.u, psi0, Q0)
+        dKdx1 = self.get_stiffness_matrix_deriv(rhoE, psi0, Q0)
+        dKdx2 = self.get_stiffness_matrix_deriv(rhoE, Q0, Q0)
+        dK1dx = self.get_dK1dx(rhoE, Q0, Q0, Q0)
+
+        dadx = (dGdx1 + dKdx1 / l0) - 0.5 * psi1 * dKdx2 + 1.5 * dK1dx
+
+        return dadx
+
+    def get_dbdx(self, rhoE, l0, Q0, dl0dx=None, du0dx=None, dQ0dx=None, dh=1e-30):
+        u0 = self.u
+        u1 = self.u1
+        u2 = self.u2
+        u1r = self.reduce_vector(u1)
         u2r = self.reduce_vector(u2)
-        K11r = self.reduce_matrix(K11)
 
-        a1 = u1r.T @ K0r @ u1r
-        a2 = K1r @ u1r
-        a = 1.5 * (u1r.T @ a2) / a1
-        b = (u2r.T @ a2 + 2 * u1r.T @ K1r @ u2r + 0.5 * u1r.T @ K11r @ u1r) / a1
-        t1 = time.time()
-        ic(t1 - t0)
+        K0r = self.reduce_matrix(self.K0)
+        # G0r = self.reduce_matrix(self.G0)
+        K1r = self.reduce_matrix(self.K1)
+        G1r = self.reduce_matrix(self.G1)
+        K11r = self.reduce_matrix(self.K11)
 
-        ic(a, b)
+        mu = -1.0 / l0
+        Q0_norm = np.linalg.norm(Q0)
+        nu = mu * u1r @ (0.5 * K1r + G1r) @ u1r * Q0_norm**2
+
+        pbpu1 = 2 * Q0_norm**2 * (u2r @ (K1r + K1r.T + G1r) + u1r @ K11r)
+        pbpu2 = Q0_norm**2 * u1r @ (2 * K1r + K1r.T)
+
+        # solve for governing equations R2
+        # Ar = G0r - mu * K0r
+        # Lr = (K0r @ u1r).reshape(-1, 1)
+        # mat = sparse.bmat([[Ar, Lr], [Lr.T, [0]]], format="csc")
+        rhs = np.hstack([pbpu2, 0])
+
+        psi = self.matfactor(-rhs)
+        # psi = sparse.linalg.spsolve(mat.T, -rhs)
+        pu2r = psi[:-1]
+        pu2 = self.full_vector(pu2r)
+        pnu = psi[-1]
+
+        # solve for governing equations R1
+        # mat = sparse.bmat(
+        #     [[Ar * Q0_norm, -Lr * Q0_norm], [-(Q0_norm**2) * Lr.T, [0]]], format="csc"
+        # )
+        pR21pu1 = nu * K0r - mu * (K1r + K1r.T + G1r)
+        pR22pu1 = u2r @ K0r
+        pfpu1 = pbpu1 + pu2r @ pR21pu1 + pnu * pR22pu1
+        pfpmu = -pu2r @ K0r @ u2r - pu2r @ (0.5 * K1r + G1r) @ u1r
+        rhs = np.hstack([pfpu1, -pfpmu])
+
+        # psi = sparse.linalg.spsolve(mat.T, -rhs)
+        psi = self.matfactor(-rhs)
+        pu1r = psi[:-1] / Q0_norm
+        pu1 = self.full_vector(pu1r)
+        pmu = -psi[-1] / Q0_norm**2
+
+        # compute the partial derivative pb/px
+        u2_dK1_u1 = self.get_dK1dx(rhoE, Q0, u2, u1)
+        u1_dK1_u2 = self.get_dK1dx(rhoE, Q0, u1, u2)
+        u1_dK11_u1 = self.get_dK11dx(rhoE, Q0, u1, u1)
+        pbpx = Q0_norm**2 * (u2_dK1_u1 + 0.5 * u1_dK11_u1 + 2 * u1_dK1_u2)
+
+        # compute pR21 / px
+        pu2_dG0dx_u2 = self.get_stress_stiffness_matrix_xuderiv(rhoE, u0, pu2, u2)
+        pu2_dK0dx_u2 = self.get_stiffness_matrix_deriv(rhoE, pu2, u2)
+        pu2_dK0dx_u1 = self.get_stiffness_matrix_deriv(rhoE, pu2, u1)
+        pu2_dK1_u1 = self.get_dK1dx(rhoE, Q0, pu2, u1)
+        pu2_dG1_u1 = self.get_stress_stiffness_matrix_xderiv(rhoE, u1, pu2, u1)
+        pu2_pR21px = (
+            pu2_dG0dx_u2
+            - mu * pu2_dK0dx_u2
+            + nu * pu2_dK0dx_u1
+            - mu * (0.5 * pu2_dK1_u1 + pu2_dG1_u1)
+        )
+
+        # compute pR22 / px
+        u1_dK0dx_u2 = self.get_stiffness_matrix_deriv(rhoE, u1, u2)
+        pR22px = u1_dK0dx_u2
+
+        # compute the partial derivative pR11/px
+        pu1_dG0dx_Q0 = self.get_stress_stiffness_matrix_xuderiv(rhoE, u0, pu1, Q0)
+        pu1_dK0dx_Q0 = self.get_stiffness_matrix_deriv(rhoE, pu1, Q0)
+        pu1_pR11px = pu1_dG0dx_Q0 - mu * pu1_dK0dx_Q0
+
+        # compute the partial derivative pR12/px
+        Q0_dK0dx_Q0 = self.get_stiffness_matrix_deriv(rhoE, Q0, Q0)
+        pR12px = -0.5 * Q0_dK0dx_Q0
+
+        # compute the total derivative db/dx
+        dbdx = pbpx + pu2_pR21px + pnu * pR22px + pu1_pR11px + pmu * pR12px
+
+        return dbdx
+
+    @timeit(print_time=True)
+    def get_dal0dx(self, l0, a, dl0dx, dadx):
+        dal0dx = dadx * l0 + a * dl0dx
+        return dal0dx
+
+    @timeit(print_time=True)
+    def get_derivative_cd(
+        self,
+        x,
+        K0,
+        K1,
+        K11,
+        G0,
+        G1,
+        du0dx,
+        dQ0dx,
+        dl0dx,
+        l0,
+        u0,
+        Q0,
+        u2,
+        u,
+        v,
+        dh=1e-4,
+        Q0_norm=None,
+    ):
+        """
+        Compute the derivative of the stiffness matrix times the vectors u
+        """
+        u1_norm = Q0_norm if Q0_norm is not None else np.linalg.norm(Q0)
+        u1 = Q0 / u1_norm
+        u1r = self.reduce_vector(u1)
+        dK1dx = np.zeros(self.nnodes)
+        dadx = np.zeros(self.nnodes)
+        dbdx = np.zeros(self.nnodes)
+        dbdx_temp = np.zeros(self.nnodes)
+        rhs_mat = np.zeros((u1r.size + 1, self.nnodes))
+        # dQdx = np.zeros((2 * self.nnodes, self.nnodes))
+
+        # Precompute detJ * Be terms outside the loop to avoid redundancy
+        detJBe = np.zeros((self.nelems, 8, 3, 4))
+        for i in range(4):
+            Be = self.Be[:, :, :, i]
+            detJ = self.detJ[:, i]
+            detJBe[:, :, :, i] = detJ.reshape(-1, 1, 1) * Be.transpose(0, 2, 1)
+
+        conn_indices = self.conn[:, :4]
+
+        t0 = time.time()
+        for n in range(x.size):
+            x1 = x.copy()
+            x2 = x.copy()
+
+            x1[n] += dh
+            x2[n] -= dh
+
+            # dxi = 2 * dh
+            # dQ0 = dQ0dx[:, n] * dxi
+
+            # Apply filtering and compute average rhoE for both perturbed vectors
+            rhoE1 = np.mean(self.fltr.apply(x1)[conn_indices], axis=1)
+            rhoE2 = np.mean(self.fltr.apply(x2)[conn_indices], axis=1)
+
+            u0_1 = u0 + du0dx[:, n] * dh
+            u0_2 = u0 - du0dx[:, n] * dh
+
+            l0_1 = l0 + dl0dx[n] * dh
+            l0_2 = l0 - dl0dx[n] * dh
+
+            u1_1 = u1 + dQ0dx[:, n] * dh / u1_norm
+            u1_2 = u1 - dQ0dx[:, n] * dh / u1_norm
+
+            # u1_1 = np.where(np.dot(u1, u1_1) < 0, -u1_1, u1_1)
+            # u1_2 = np.where(np.dot(u1, u1_2) < 0, -u1_2, u1_2)
+
+            u1_1_norm = u1_norm
+            u1_2_norm = u1_norm
+
+            # Q0_1 = Q0 + dQ0dx[:, n] * dh
+            # Q0_2 = Q0 - dQ0dx[:, n] * dh
+
+            # # Adjust the direction of Q1 and Q2 if necessary
+            # Q0_1 = np.where(np.dot(Q0, Q0_1) < 0, -Q0_1, Q0_1)
+            # Q0_2 = np.where(np.dot(Q0, Q0_2) < 0, -Q0_2, Q0_2)
+
+            # # Normalize Q1 and Q2
+            # u1_1_norm = np.linalg.norm(Q0_1)
+            # u1_2_norm = np.linalg.norm(Q0_2)
+            # u1_1 = Q0_1 / u1_1_norm
+            # u1_2 = Q0_2 / u1_2_norm
+
+            dl = l0_1 - l0_2
+            du1 = u1_1 - u1_2
+
+            ue0_1 = np.zeros((self.nelems, 8), dtype=rhoE1.dtype)
+            ue0_2 = np.zeros((self.nelems, 8), dtype=rhoE2.dtype)
+            ue0_1[:, ::2] = u0_1[2 * self.conn]
+            ue0_1[:, 1::2] = u0_1[2 * self.conn + 1]
+            ue0_2[:, ::2] = u0_2[2 * self.conn]
+            ue0_2[:, 1::2] = u0_2[2 * self.conn + 1]
+
+            ue1_1 = np.zeros((self.nelems, 8), dtype=rhoE1.dtype)
+            ue1_2 = np.zeros((self.nelems, 8), dtype=rhoE2.dtype)
+            ue1_1[:, ::2] = u1_1[2 * self.conn]
+            ue1_1[:, 1::2] = u1_1[2 * self.conn + 1]
+            ue1_2[:, ::2] = u1_2[2 * self.conn]
+            ue1_2[:, 1::2] = u1_2[2 * self.conn + 1]
+
+            # Compute the element stiffnesses
+            if self.ptype_K == "simp":
+                C1 = np.outer(rhoE1**self.p + self.rho0_K, self.C0)
+                C2 = np.outer(rhoE2**self.p + self.rho0_K, self.C0)
+            else:  # ramp
+                C1 = np.outer(
+                    rhoE1 / (1.0 + self.q * (1.0 - rhoE1)) + self.rho0_K, self.C0
+                )
+                C2 = np.outer(
+                    rhoE2 / (1.0 + self.q * (1.0 - rhoE2)) + self.rho0_K, self.C0
+                )
+
+            C1 = C1.reshape((self.nelems, 3, 3))
+            C2 = C2.reshape((self.nelems, 3, 3))
+
+            Ke0_1 = np.zeros((self.nelems, 8, 8), dtype=rhoE1.dtype)
+            Ke1_1 = np.zeros((self.nelems, 8, 8), dtype=rhoE1.dtype)
+            Ke11_1 = np.zeros((self.nelems, 8, 8), dtype=rhoE1.dtype)
+
+            Ge0_1 = np.zeros((self.nelems, 8, 8), dtype=rhoE1.dtype)
+            Ge1_1 = np.zeros((self.nelems, 8, 8), dtype=rhoE1.dtype)
+
+            Ke0_2 = np.zeros((self.nelems, 8, 8), dtype=rhoE2.dtype)
+            Ke1_2 = np.zeros((self.nelems, 8, 8), dtype=rhoE2.dtype)
+            Ke11_2 = np.zeros((self.nelems, 8, 8), dtype=rhoE2.dtype)
+
+            Ge0_2 = np.zeros((self.nelems, 8, 8), dtype=rhoE2.dtype)
+            Ge1_2 = np.zeros((self.nelems, 8, 8), dtype=rhoE2.dtype)
+
+            dKe0 = np.zeros((self.nelems, 8, 8), dtype=rhoE1.dtype)
+            dKe1 = np.zeros((self.nelems, 8, 8), dtype=rhoE1.dtype)
+            dKe11 = np.zeros((self.nelems, 8, 8), dtype=rhoE1.dtype)
+
+            dGe0 = np.zeros((self.nelems, 8, 8), dtype=rhoE1.dtype)
+            dGe1 = np.zeros((self.nelems, 8, 8), dtype=rhoE1.dtype)
+
+            for i in range(4):
+                detJ = self.detJ[:, i]
+                Be = self.Be[:, :, :, i]
+                Te = self.Te[:, :, :, :, i]
+                detJBei = detJBe[:, :, :, i]
+
+                Be1_1 = np.zeros((self.nelems, 3, 8), dtype=rhoE1.dtype)
+                Be1_2 = np.zeros((self.nelems, 3, 8), dtype=rhoE2.dtype)
+                populate_nonlinear_strain_and_Be(Be, ue1_1, Be1_1)
+                populate_nonlinear_strain_and_Be(Be, ue1_2, Be1_2)
+
+                CKBe_1 = C1 @ Be
+                CKBe_2 = C2 @ Be
+                dCKBe = (C1 - C2) @ Be
+
+                CKBe1_1 = C1 @ Be1_1
+                CKBe1_2 = C2 @ Be1_2
+                dCKBe1 = C1 @ Be1_1 - C2 @ Be1_2
+                dBe1CBe1 = (
+                    Be1_1.transpose(0, 2, 1) @ CKBe1_1
+                    - Be1_2.transpose(0, 2, 1) @ CKBe1_2
+                )
+
+                Ke0_1 += detJBei @ CKBe_1
+                Ke1_1 += detJBei @ CKBe1_1
+                Ke11_1 += detJ.reshape(-1, 1, 1) * Be1_1.transpose(0, 2, 1) @ CKBe1_1
+
+                Ke0_2 += detJBei @ CKBe_2
+                Ke1_2 += detJBei @ CKBe1_2
+                Ke11_2 += detJ.reshape(-1, 1, 1) * Be1_2.transpose(0, 2, 1) @ CKBe1_2
+
+                dKe0 += detJBei @ dCKBe
+                dKe1 += detJBei @ dCKBe1
+                dKe11 += detJ.reshape(-1, 1, 1) * dBe1CBe1
+
+                s0_1 = np.einsum("nik,nk -> ni", CKBe_1, ue0_1)
+                G0e_1 = detJ.reshape(-1, 1, 1) * np.einsum("ni,nijl -> njl", s0_1, Te)
+                Ge0_1[:, 0::2, 0::2] += G0e_1
+                Ge0_1[:, 1::2, 1::2] += G0e_1
+
+                s0_2 = np.einsum("nik,nk -> ni", CKBe_2, ue0_2)
+                G0e_2 = np.einsum("n,ni,nijl -> njl", detJ, s0_2, Te)
+                Ge0_2[:, 0::2, 0::2] += G0e_2
+                Ge0_2[:, 1::2, 1::2] += G0e_2
+
+                s1_1 = np.einsum("nik,nk -> ni", CKBe_1, ue1_1)
+                G1e_1 = np.einsum("n,ni,nijl -> njl", detJ, s1_1, Te)
+                Ge1_1[:, 0::2, 0::2] += G1e_1
+                Ge1_1[:, 1::2, 1::2] += G1e_1
+
+                s1_2 = np.einsum("nik,nk -> ni", CKBe_2, ue1_2)
+                G1e_2 = np.einsum("n,ni,nijl -> njl", detJ, s1_2, Te)
+                Ge1_2[:, 0::2, 0::2] += G1e_2
+                Ge1_2[:, 1::2, 1::2] += G1e_2
+
+                dG0e = detJ.reshape(-1, 1, 1) * np.einsum(
+                    "ni,nijl -> njl", (s0_1 - s0_2), Te
+                )
+                dGe0[:, 0::2, 0::2] += dG0e
+                dGe0[:, 1::2, 1::2] += dG0e
+
+                dG1e = np.einsum("n,ni,nijl -> njl", detJ, (s1_1 - s1_2), Te)
+                dGe1[:, 0::2, 0::2] += dG1e
+                dGe1[:, 1::2, 1::2] += dG1e
+
+            K0_1 = sparse.csc_matrix((Ke0_1.flatten(), (self.i, self.j)))
+            K1_1 = sparse.csc_matrix((Ke1_1.flatten(), (self.i, self.j)))
+            K11_1 = sparse.csc_matrix((Ke11_1.flatten(), (self.i, self.j)))
+            G0_1 = sparse.csc_matrix((Ge0_1.flatten(), (self.i, self.j)))
+            G1_1 = sparse.csc_matrix((Ge1_1.flatten(), (self.i, self.j)))
+
+            K0_2 = sparse.csc_matrix((Ke0_2.flatten(), (self.i, self.j)))
+            K1_2 = sparse.csc_matrix((Ke1_2.flatten(), (self.i, self.j)))
+            K11_2 = sparse.csc_matrix((Ke11_2.flatten(), (self.i, self.j)))
+            G0_2 = sparse.csc_matrix((Ge0_2.flatten(), (self.i, self.j)))
+            G1_2 = sparse.csc_matrix((Ge1_2.flatten(), (self.i, self.j)))
+
+            dK0 = sparse.csc_matrix((dKe0.flatten(), (self.i, self.j)))
+            dK1 = sparse.csc_matrix((dKe1.flatten(), (self.i, self.j)))
+            dK11 = sparse.csc_matrix((dKe11.flatten(), (self.i, self.j)))
+            dG0 = sparse.csc_matrix((dGe0.flatten(), (self.i, self.j)))
+            dG1 = sparse.csc_matrix((dGe1.flatten(), (self.i, self.j)))
+
+            K0r_1 = self.reduce_matrix(K0_1)
+            K1r_1 = self.reduce_matrix(K1_1)
+            K11r_1 = self.reduce_matrix(K11_1)
+            G0r_1 = self.reduce_matrix(G0_1)
+            G1r_1 = self.reduce_matrix(G1_1)
+            u1r_1 = self.reduce_vector(u1_1)
+
+            K0r_2 = self.reduce_matrix(K0_2)
+            K1r_2 = self.reduce_matrix(K1_2)
+            K11r_2 = self.reduce_matrix(K11_2)
+            G0r_2 = self.reduce_matrix(G0_2)
+            G1r_2 = self.reduce_matrix(G1_2)
+            u1r_2 = self.reduce_vector(u1_2)
+
+            K0r = self.reduce_matrix(K0)
+            K1r = self.reduce_matrix(K1)
+            K11r = self.reduce_matrix(K11)
+            G0r = self.reduce_matrix(G0)
+            G1r = self.reduce_matrix(G1)
+            u1r = self.reduce_vector(u1)
+
+            dK0r = self.reduce_matrix(dK0)
+            dK1r = self.reduce_matrix(dK1)
+            dK11r = self.reduce_matrix(dK11)
+            dG0r = self.reduce_matrix(dG0)
+            dG1r = self.reduce_matrix(dG1)
+            du1r = self.reduce_vector(du1)
+            u2r = self.reduce_vector(u2)
+
+            Ar_1 = K0r_1 + l0_1 * G0r_1
+            Ar_2 = K0r_2 + l0_2 * G0r_2
+
+            L_1 = (K0r_1 @ u1r_1).reshape(-1, 1)
+            L_2 = (K0r_2 @ u1r_2).reshape(-1, 1)
+
+            rhs_1 = np.hstack([-(G1r_1 + 0.5 * K1r_1) @ u1r_1, 0])
+            rhs_2 = np.hstack([-(G1r_2 + 0.5 * K1r_2) @ u1r_2, 0])
+
+            mat_1 = sparse.bmat([[Ar_1, L_1], [L_1.T, [0]]], format="csc")
+            mat_2 = sparse.bmat([[Ar_2, L_2], [L_2.T, [0]]], format="csc")
+
+            u2r_1 = sparse.linalg.spsolve(mat_1, rhs_1)[:-1]
+            u2r_2 = sparse.linalg.spsolve(mat_2, rhs_2)[:-1]
+            u2_1 = self.full_vector(u2r_1)
+            u2_2 = self.full_vector(u2r_2)
+
+            # # use cg to solve the linear system
+            # u2r_1, _ = sparse.linalg.cg(mat_1, rhs_1, atol=1e-20,rtol=1e-20)
+            # u2r_2, _ = sparse.linalg.cg(mat_2, rhs_2, atol=1e-20,rtol=1e-20)
+            # u2r_1 = u2r_1[:-1]
+            # u2r_2 = u2r_2[:-1]
+            # u2_1 = self.full_vector(u2r_1)
+            # u2_2 = self.full_vector(u2r_2)
+
+            # dQr = -(dG1r + 0.5 * dK1r) @ u1r - (G1r + 0.5 * K1r) @ du1r
+            # rhsr1 = -(dK0r + dl * G0r + l0 * dG0r) @ u2r + dQr
+            # # rhs1r = self.reduce_vector(rhs1)
+
+            # dLr = dK0r @ u1r + K0r @ du1r
+            # rhsr2 = -dLr.T @ u2r
+
+            # rhsr = np.hstack([rhsr1, rhsr2])
+
+            # Ar = K0r + l0 * G0r
+            # Lr = (K0r @ u1r).reshape(-1, 1)
+            # mat = sparse.bmat([[Ar, Lr], [Lr.T, [0]]], format="csc")
+
+            # rhs_mat[:, n] = rhsr
+            # du2r = sparse.linalg.spsolve(mat, rhsr)[:-1]
+            # du2 = self.full_vector(du2r)
+
+            # # # use cg to solve the linear system
+            # # du2rdx, _ = sparse.linalg.cg(mat, rhs, atol=1e-20,rtol=1e-20)
+            # # du2 = self.full_vector(du2rdx[:-1])
+
+            # # for ii in range(10):
+            # #     print(u2_1[ii]- u2_2[ii], du2[ii])
+
+            # ic(np.allclose(u2_1 - u2_2, du2, atol=1e-10))
+            # exit()
+
+            # D_1 = K1r_1 @ u1r_1
+            # D_2 = K1r_2 @ u1r_2
+
+            a_1 = 1.5 * u1_1_norm**2 * u1r_1.T @ K1r_1 @ u1r_1
+            a_2 = 1.5 * u1_2_norm**2 * u1r_2.T @ K1r_2 @ u1r_2
+
+            b_1 = u1_1_norm**2 * (
+                u2r_1.T @ K1r_1 @ u1r_1
+                + 2 * u1r_1.T @ K1r_1 @ u2r_1
+                + 0.5 * u1r_1.T @ K11r_1 @ u1r_1
+            )
+            b_2 = u1_2_norm**2 * (
+                u2r_2.T @ K1r_2 @ u1r_2
+                + 2 * u1r_2.T @ K1r_2 @ u2r_2
+                + 0.5 * u1r_2.T @ K11r_2 @ u1r_2
+            )
+
+            # du2 = self.full_vector(u2r_1 - u2r_2)
+            # ic(dQ0.shape, Q0.shape)
+
+            # Na = u1.T @ K1 @ u1
+            # dNa = (u1.T @ dK1 + du1.T @ (K1 + K1.T)) @ u1
+            # du1_norm = Q0.T @ dQ0
+            # da = 3 * du1_norm * Na + 1.5 * u1_norm**2 * dNa
+            # dadx[n] = da / dxi
+
+            # Nb = u2r.T @ (K1r + 2 * K1r.T) @ u1r + 0.5 * u1r.T @ K11r @ u1r
+            # dNb1 = (u2r.T @ (dK1r + 2 * dK1r.T) + 0.5 * u1r.T @ dK11r) @ u1r
+            # dNb2 = du2r.T @ (K1r + 2 * K1r.T) @ u1r
+            # dNb3 = (u2r.T @ (K1r + 2 * K1r.T) + u1r.T @ K11r) @ du1r
+            # dN = dNb1 + dNb2 + dNb3
+            # db = 2 * du1_norm * Nb + u1_norm**2 * dN
+            # dbdx[n] = db / dxi
+
+            # ic(np.allclose(a_2, a2))
+            # ic(np.allclose(a_1, a1))
+
+            # dK = sparse.csc_matrix((dKe.flatten(), (self.i, self.j)))
+            # dK1dx[n] = (u.T @ dK @ v) / (2 * dh)
+
+            # dK1dx[n] = (u.T @ (K1_1 - K1_2) @ v) / (2 * dh)
+            # dbdx_temp[n] = (b_1 - b_2) / (2 * dh)
+            # ic(a_1-a_2, da)
+            # print(b_1 - b_2, db)
+            # exit()
+            dadx[n] = (a_1 - a_2) / (2 * dh)
+            dbdx[n] = (b_1 - b_2) / (2 * dh)
+            # dadx[n] = (a_1 - a_2) / (2 * dh)
+            # dQdx[:, n] = (Q1 - Q2) / (2 * dh)
+
+            _print_progress(n, self.nnodes, t0, "da/dx")
+
+        return dadx, dbdx
+
+    def check_derivative(self, rhoE, lam_c, u0, u1):
+        # set random seed
+        np.random.seed(1234)
+
+        # set the perturbation size
+        dh = 5e-3
+        p = np.random.rand(self.x.size)
+        p /= np.linalg.norm(p)
+        x0 = self.x
+
+        self.initialize()
+        Q0 = self.Q[:, 0]
+        Q0_norm = np.linalg.norm(Q0)
+        self.initialize_koiter(Q0_norm)
+        self.initialize_koiter_derivative()
+
+        # Compute the perturbed design variables
+        self.x = x0 + dh * p
+        self.initialize()
+        rhoE1, l1, Q1, u01 = self.rhoE, self.lam[0], self.Q[:, 0], self.u
+        Q1 = np.where(np.dot(Q0, Q1) < 0, -Q1, Q1)
+        a1, b1, u11, u21, K1_1, _, G1_1 = self.get_koiter_ab(
+            rhoE1, l1, u01, Q1, Q0_norm
+        )
+
+        self.x = x0 - dh * p
+        self.initialize()
+        rhoE2, l2, Q2, u02 = self.rhoE, self.lam[0], self.Q[:, 0], self.u
+        Q2 = np.where(np.dot(Q0, Q2) < 0, -Q2, Q2)
+        a2, b2, u12, u22, K1_2, _, G1_2 = self.get_koiter_ab(
+            rhoE2, l2, u02, Q2, Q0_norm
+        )
+
+        # Restore original x value to avoid side effects
+        self.x = x0
+        self.initialize()
+        rhoE, l0, u0, Q0 = self.rhoE, self.lam[0], self.u, self.Q[:, 0]
+        a, b, u1, u2, K1, K11, G1 = self.get_koiter_ab(rhoE, l0, u0, Q0)
+
+        u1_norm = np.linalg.norm(Q0)
+        u1 = Q0 / u1_norm
+
+        #  Adjust eigenvectors' direction based on the dot product with Q0
+        Q1 = np.where(np.dot(Q0, Q1) < 0, -Q1, Q1)
+        Q2 = np.where(np.dot(Q0, Q2) < 0, -Q2, Q2)
+
+        ic(l1, l2)
+
+        dldx_cd = (l1 - l2) / (2 * dh)
+        dldx = self.get_dldx()
+        dldxp = np.dot(p, dldx)
+
+        print("lam_c Exact: ", dldxp)
+        print("lam_c CD   : ", dldx_cd)
+        print("lam_c Error: ", (dldxp - dldx_cd) / dldx_cd, "\n")
+
+        Q1_norm = np.linalg.norm(Q1)
+        Q2_norm = np.linalg.norm(Q2)
+
+        D1 = -l1 * u01.T @ K1_1 @ u11
+        D2 = -l2 * u02.T @ K1_2 @ u12
+        # D1 = u11.T @ K0_1 @ u11
+        # D2 = u12.T @ K0_2 @ u12
+        ic(D1, D2)
+        D_cd = (D1 - D2) / (2 * dh)
+
+        ic(self.Q[:, 0] @ K1 @ self.Q[:, 0])
+        # self.initialize()
+        self.initialize_adjoint()
+        # Qb = -2 / u1_norm**4 * Q0  + 2 / u1_norm**2 * K0 @ Q0
+        Qb = -2 / Q0_norm**4 * Q0
+        self.Qrb[:, 0] = self.reduce_vector(Qb)
+        self.finalize_adjoint()
+        dnormdx = self.xb
+        ans = np.dot(p, dnormdx)
+
+        print("D ans  : ", ans)
+        print("D CD   : ", D_cd)
+        print("D Error: ", (ans - D_cd) / D_cd, "\n")
+
+        # check if G1 is symmetric
+        ic(np.allclose(G1.todense(), G1.todense().T))
+        ic(np.allclose(K1.todense(), K1.todense().T))
+
+        dK1dQ0 = self.get_dK1du(rhoE, Q0, Q0)
+
+        # dK1dQ0_cd = self.get_dK1dQ0_cs(rhoE, l0, u0, Q0, Q0)
+        G = self.get_stress_stiffness_matrix(self.rho, Q0)
+        # ic(np.allclose(G.todense(), G.todense().T))
+
+        # ic(np.allclose(dK1dQ0_cd, dK1dQ0))
+        ic(np.allclose(G1 @ Q0 * u1_norm, dK1dQ0))
+
+        # ic(np.allclose(G.todense(), dK1dQ0_cd.T))
+        # ic(np.allclose(G.todense(), dK1dQ0_cd))
+
+        # dK1dx_c = self.get_dK1dx(rhoE, Q0, Q0, Q0)
+        # dK1dx_c = self.fltr.apply_gradient(dK1dx_c, x)
+
+        self.initialize_adjoint()
+        # Qb = (Q0.T @ (K1 + K1.T + G)) / u1_norm**2 - 2 * (
+        #     Q0.T @ K1 @ Q0
+        # ) * Q0.T / u1_norm**4
+        Qb = Q0.T @ (K1 + K1.T)
+        self.Qrb[:, 0] = self.reduce_vector(Qb)
+        self.finalize_adjoint()
+        dNdx1 = np.dot(p, self.xb)
+
+        dK0dx, dG0dx, du0dx = self.get_dG0dx_dK0dx_du0dx_cs(
+            x0, self.K0, self.G0, u0, Q0
+        )
+        dQ0dx, dl0dx = self.get_dQ0dx_dl0dx(x0, self.K0, self.G0, dK0dx, dG0dx, l0, Q0)
+
+        dl0dx = self.get_dldx()
+        # dQ0dx = self.get_exact_dQ0dx(Q0)
+
+        # check if the computed dQ0dx is correct compared to dQ0dx0
+        # ic(np.allclose(dQ0dx, dQ0dx0))
+
+        # for i in range(5):
+        #     print(dQ0dx0[0,i])
+        #     print(dQ0dx[0,i])
+        #     print((dQ0dx0[0,i] - dQ0dx[0,i]) / dQ0dx[0,i])
+        #     print()
         # exit()
 
-        indy = 2 * np.nonzero(self.f[1::2])[0] + 1
-        indy = indy[len(indy) // 2]
-        indx = indy - 1
+        # dK1dx, dadx, dQdx = self.get_derivative_cd(x, Q0, Q0, dh=dh)
 
-        xi = np.linspace(-1e1, 1e1, 100)
+        # ic(np.allclose(dQdx, dQdx_lee))
 
-        lam = (1 + a * xi + b * xi**2) * lam_c
+        # for i in range(5):
+        #     print(f"{dQdx[10, i]:15.5e}{dQdx_lee[10, i]:15.5e}{dQdx[10, i]/dQdx_lee[10, i]:15.5e}")
 
-        ux = u0[indx] * lam + u1[indx] * xi + u2[indx] * xi**2
-        uy = u0[indy] * lam + u1[indy] * xi + u2[indy] * xi**2
+        dK1dx_c = self.get_dK1dx_cd(x0, dQ0dx, Q0, Q0, Q0, dh=dh)
+        dNdx1 = np.dot(p, Q0 @ (K1 + K1.T) @ dQ0dx + dK1dx_c)
 
-        lam_0 = np.linspace(0, lam_c, 100)
-        u0x = u0[indx] * lam_0
-        u0y = u0[indy] * lam_0
+        N1 = Q1.T @ K1_1 @ Q1
+        N2 = Q2.T @ K1_2 @ Q2
 
-        fig, ax = plt.subplots(1, 4, figsize=(16, 3), tight_layout=True)
-        ax[0].plot(xi, lam / lam_c, color="k")
-        ax[0].plot([0, 0], [0, 1], color="b")
-        ax[0].scatter(0, 1, color="r", zorder=10)
-        ax[0].set_xlabel(r"$\xi$")
-        ax[0].set_ylabel(r"$\lambda/\lambda_c$")
-        ax[0].ticklabel_format(style="sci", axis="x", scilimits=(0, 0))
+        dNdx_cd = (N1 - N2) / (2 * dh)
 
-        ax[1].plot(u0x, lam_0, color="b")
-        ax[1].plot(ux, lam, color="k")
-        ax[1].scatter(u0[indx] * lam_c, lam_c, color="r", zorder=10)
-        ax[1].set_xlabel(r"$u_x$")
-        ax[1].set_ylabel(r"$\lambda$")
-        ax[1].ticklabel_format(style="sci", axis="x", scilimits=(0, 0))
+        print("N ans  : ", dNdx1)
+        print("N CD   : ", dNdx_cd)
 
-        ax[2].plot(u0y, lam_0, color="b")
-        ax[2].plot(uy, lam, color="k")
-        ax[2].scatter(u0[indy] * lam_c, lam_c, color="r", zorder=10)
-        ax[2].set_xlabel(r"$u_y$")
-        ax[2].set_ylabel(r"$\lambda$")
-        ax[2].ticklabel_format(style="sci", axis="x", scilimits=(0, 0))
-        ax[2].invert_xaxis()
+        dadx, dbdx = self.get_derivative_cd(
+            self.x,
+            self.K0,
+            K1,
+            K11,
+            self.G0,
+            G1,
+            du0dx,
+            dQ0dx,
+            dl0dx,
+            l0,
+            u0,
+            Q0,
+            u2,
+            Q0,
+            Q0,
+            dh,
+            Q0_norm,
+        )
+        dadx = np.dot(p, dadx)
+        dbdx = np.dot(p, dbdx)
 
-        res_norm0 = np.zeros(len(xi))
-        res_norm = np.zeros(len(xi))
-        # for i in range(len(xi)):
-        #     ui = u0 * lam[i] + u1 * xi[i] + u2 * xi[i] ** 2
-        #     u0i = u0 * lam[i]
-        #     res = self.getResidual(self.rhoE, ui, lam[i])[1]
-        #     res_norm[i] = np.linalg.norm(res)
+        print("a ans  : ", dadx)
 
-        #     res = self.getResidual(self.rhoE, u0i, lam_c)[1]
-        #     res_norm0[i] = np.linalg.norm(res)
-        #     print(f"Residual[{i:3d}]  {res_norm[i]:15.5e}")
+        print("b ans  : ", dbdx)
 
-        ax[3].semilogy(xi, res_norm, color="b")
-        ax[3].semilogy(xi, res_norm0, color="k")
-        ax[3].set_xlabel(r"$\xi$")
-        ax[3].set_ylabel(r"$||R||$")
-        ax[3].ticklabel_format(style="sci", axis="x", scilimits=(0, 0))
+        self.initialize_koiter(Q0_norm)
+        self.initialize_koiter_derivative()
 
-        plt.savefig("load-deflection.pdf", bbox_inches="tight")
+        dbdx_fast = self.get_dbdx(rhoE, l0, Q0, dl0dx, du0dx, dQ0dx)
 
-        def plot_u():
-            xi = 1e1
-            lam = (1 + a * xi + b * xi**2) * lam_c
-            u = u0 * lam + u1 * xi + u2 * xi**2
-            u_lin = u0 * lam
-            u_list = [u0, u1, u0 * lam_c, u_lin, u]
+        # print("a CD   : ", np.dot(p, self.dadx))
+        print("a fast : ", np.dot(p, self.dadx))
+        print("b fast : ", np.dot(p, dbdx_fast))
 
-            fig, ax = plt.subplots(1, 5, figsize=(15, 4))
-            levels = np.linspace(0.0, 1.0, 26)
-            title = [
-                r"$u_0$",
-                r"$u_1$",
-                r"$u_0 \lambda_c$",
-                r"$u_0 \lambda$",
-                r"$u$ at $\lambda = " + f"{lam:.2f}$",
-            ]
-            for i, u in enumerate(u_list):
-                self.plot(
-                    self.rho, ax=ax[i], u=u, levels=levels, extend="max", cmap="Greys"
-                )
-                ax[i].set_title(title[i])
-                ax[i].set_xticks([])
-                ax[i].set_yticks([])
+        dadx, dbdx = self.get_dadx_dbdx_cd(x0, du0dx, dl0dx, dQ0dx, u0, l0, Q0, dh=dh)
 
-            plt.savefig("u.pdf", bbox_inches="tight")
+        dadx = np.dot(p, dadx)
+        dbdx = np.dot(p, dbdx)
+        print("a CD   : ", dadx)
+        print("b CD   : ", dbdx)
 
-        plot_u()
+        # print("a ans  : ", 1.5 * np.dot(p, Q0 @ (K1 + K1.T) @ dQ0dx + dK1dx_c))
+        # print("a CD   : ", 1.5 * np.dot(self.xb + dK1dx_c, p))
+        # print("a CD   : ", 1.5 * dNdx_cd)
+        # print("a CD   : ", (a1 - a2) / (2 * dh))
+        # print("a CD   : ", np.dot(p, dadx))
 
-        self.K0 = K0
-        self.K1 = K1
-        self.G0 = G0
-        self.G1 = G1
-        self.K11 = K11
+        dadx, dbdx = self.get_dadx_dbdx_cs(x0, du0dx, dl0dx, dQ0dx, u0, l0, Q0, dh=dh)
 
-        return a, b, u1, u2
+        dadx = np.dot(p, dadx)
+        dbdx = np.dot(p, dbdx)
+        print("a CS   : ", dadx)
+        print("b CS   : ", dbdx)
+        print("b CD   : ", (b1 - b2) / (2 * dh))
+
+        ic(a, a1, a2)
+
+        t0 = time.time()
+        Gr = self.reduce_matrix(self.G0)
+        Kr = self.reduce_matrix(self.K0)
+        mu = -1 / l0
+
+        Ar = Gr - mu * Kr
+        Q0r = self.reduce_vector(Q0)
+        Lr = (Kr @ Q0r).reshape(-1, 1)
+        K1r = self.reduce_matrix(K1)
+        mat = sparse.bmat([[Ar, -Lr], [-Lr.T, [0]]], format="csc")
+
+        rhs = np.hstack([Q0r @ (K1r.T + 2 * K1r), 0])
+        psi = sparse.linalg.spsolve(mat, -1.5 * rhs)
+        psi0 = self.full_vector(psi[:-1])
+        psi1 = psi[-1]
+
+        dGdx1 = self.get_stress_stiffness_matrix_xuderiv(self.rhoE, self.u, psi0, Q0)
+        dKdx1 = self.get_stiffness_matrix_deriv(self.rhoE, psi0, Q0)
+        dKdx2 = self.get_stiffness_matrix_deriv(self.rhoE, Q0, Q0)
+        dK1dx = self.get_dK1dx(self.rhoE, Q0, Q0, Q0)
+
+        dadx = dGdx1 - mu * dKdx1 - 0.5 * psi1 * dKdx2 + 1.5 * dK1dx
+        t1 = time.time()
+        print("Time: ", t1 - t0)
+        # dadx = 1.5 * Q0.T @ (K1 + K1.T) @ dQ0dx + 1.5 * dK1dx_c
+        dadx = np.dot(p, dadx)
+        print("a ans  : ", dadx)
+
+        self.initialize_adjoint()
+        dK1dQ0_cd = self.get_dK1dQ0_cd(rhoE, Q0, Q0, Q0, dh=1e-4)
+        Qb = Q0.T @ (2 * K1 + K1.T)  # + dK1dQ0_cd
+        self.Qrb[:, 0] = self.reduce_vector(Qb)
+        self.finalize_adjoint()
+
+        a_cd = np.dot(p, 1.5 * (self.xb + dK1dx))
+
+        self.initialize_adjoint()
+        dK1dQ0_cs = self.get_dK1dQ0_cs(rhoE, K1, Q0, Q0, Q0, dh=1e-30)
+        Qb = Q0.T @ (K1 + K1.T) + dK1dQ0_cs
+        self.Qrb[:, 0] = self.reduce_vector(Qb)
+        self.finalize_adjoint()
+
+        a_cs = np.dot(p, 1.5 * (self.xb + dK1dx))
+
+        print("a cs   : ", a_cs)
+        print("a cd   : ", a_cd)
+
+        exit()
+
+        G_1 = self.get_stress_stiffness_matrix(self.rho, u1)
+        G_2 = self.get_stress_stiffness_matrix(self.rho, u2)
+
+        # Check if G_1 and G_2 are symmetric
+        ic(np.allclose(G_1.todense(), G_1.todense().T))
+        ic(np.allclose(G_2.todense(), G_2.todense().T))
+
+        aa = G_1 @ u2
+        bb = G_2 @ u1
+        # check if G_1 @ u2 = G_2 @ u1
+        ic(np.allclose(aa, bb))
+
+        u1Gu2 = self.get_dK1dQ0_cs(self.rhoE, K1, Q0, u1, u2) * u1_norm
+
+        ic(aa.shape, bb.shape, u1Gu2.shape)
+
+        ic(np.allclose(u1Gu2, aa))
+        ic(np.allclose(u1Gu2, bb))
+
+        for i in range(10):
+            print(f"{u1Gu2[i]:15.5e}{aa[i]:15.5e}{bb[i]:15.5e}")
+
+        exit()
+
+        t0 = time.time()
+        papx = self.get_papx_cs(self.x, a, Q0)
+
+        # use linspace gererate dh from 1e+1 to 1e-10
+        dh0 = 6
+        dh1 = -20
+        dhn = 4 * (dh0 - dh1 + 1)
+        dh = np.logspace(dh0, dh1, num=dhn)
+
+        a_cs = np.zeros(dhn)
+        a_cd = np.zeros(dhn)
+
+        # for di in range(dhn):
+        #     ic(dh[di])
+        #     self.initialize_adjoint()
+        #     dK1dQ0_cs = self.get_dK1dQ0_cs(rhoE, K1, Q0, Q0, Q0, dh=dh[di])
+        #     Qb = Q0.T @ (K1 + K1.T) + dK1dQ0_cs
+        #     self.Qrb[:, 0] = self.reduce_vector(Qb)
+        #     self.finalize_adjoint()
+
+        #     a_cs[di] = np.dot(p, 1.5 * self.xb + papx)
+        #     ic(a_cs[di])
+
+        #     self.initialize_adjoint()
+        #     dK1dQ0_cd = self.get_dK1dQ0_cd(rhoE, Q0, Q0, Q0, dh=dh[di])
+        #     Qb = Q0.T @ (K1 + K1.T) + dK1dQ0_cd
+        #     self.Qrb[:, 0] = self.reduce_vector(Qb)
+        #     self.finalize_adjoint()
+
+        #     a_cd[di] = np.dot(p, 1.5 * self.xb + papx)
+        #     ic(a_cd[di])
+
+        # # save the data
+        # np.save("./output/a_cs.npy", a_cs)
+        # np.save("./output/a_cd.npy", a_cd)
+
+        # read the data
+        a_cs = np.load("./output/a_cs.npy")
+        a_cd = np.load("./output/a_cd.npy")
+
+        self.initialize_adjoint()
+        dK1dQ0_cd = self.get_dK1dQ0_cd(rhoE, Q0, Q0, Q0, dh=1e-4)
+        Qb = Q0.T @ (K1 + K1.T) + dK1dQ0_cd
+        self.Qrb[:, 0] = self.reduce_vector(Qb)
+        self.finalize_adjoint()
+
+        a_ans1 = np.dot(p, 1.5 * self.xb + papx)
+
+        self.initialize_adjoint()
+        dK1dQ0_cs = self.get_dK1dQ0_cs(rhoE, K1, Q0, Q0, Q0, dh=1e-100)
+        Qb = Q0.T @ (K1 + K1.T) + dK1dQ0_cs
+        self.Qrb[:, 0] = self.reduce_vector(Qb)
+        self.finalize_adjoint()
+
+        a_ans2 = np.dot(p, 1.5 * self.xb + papx)
+
+        dK1dx = self.get_dK1dx(rhoE, Q0, Q0, Q0)
+        dK1du = self.get_dK1du(rhoE, Q0, Q0)
+        dK1dQ0 = dK1du / u1_norm
+
+        self.initialize_adjoint()
+        Qb = Q0.T @ (K1 + K1.T) + G1 @ Q0
+        self.Qrb[:, 0] = self.reduce_vector(Qb)
+        self.finalize_adjoint()
+
+        a_ans3 = np.dot(p, (1.5 * self.xb + 1.5 * dK1dx))
+
+        a_ans = [a_ans1, a_ans2, a_ans3]
+        title = [
+            f"baseline: cd = 1e-4",
+            f"baseline: cs = 1e-100",
+            f"baseline: analytical",
+        ]
+
+        fig, ax = plt.subplots(1, 3, figsize=(12, 3.5), tight_layout=True)
+        for i in range(3):
+            error_cd = np.abs((a_cd - a_ans[i]) / a_ans[i])
+            error_cs = np.abs((a_cs - a_ans[i]) / a_ans[i])
+            ax[i].plot(dh, error_cs, label="CS")
+            ax[i].plot(dh, error_cd, label="CD")
+            ax[i].set_xscale("log")
+            ax[i].set_yscale("log")
+            ax[i].set_xlabel("dh")
+            ax[i].set_ylabel("Relative Error")
+            ax[i].invert_xaxis()
+            ax[i].set_title(title[i])
+            ax[i].legend()
+        plt.savefig("./output/error.pdf")
+        exit()
+
+        t3 = time.time()
+
+        print("a CS   : ", a_cs)
+        print("a CD   : ", a_cd)
+        print("a ans  : ", a_ans)
+        print("a error: ", (a_cs - a_ans) / a_ans)
+        print("t CS   : ", t1 - t0)
+        print("t ans  : ", t3 - t2)
+
+        # for i in range(2 * self.nnodes):
+        #     print(
+        #         f"{dK1dQ0_cd[i]:15.5e}{dK1du[i]/u1_norm:15.5e}{(dK1dQ0_cd[i] - dK1du[i]/u1_norm)/dK1dQ0_cd[i]:15.5e}"
+        #     )
+
+        # for i in range(self.nnodes):
+        #     print(
+        #         f"{papx[i]:15.5e}{1.5 * dK1dx[i]:15.5e}{(papx[i] - 1.5 * dK1dx[i])/papx[i]:15.5e}"
+        #     )
+        exit()
+
+        dal0dx = self.get_dal0dx(l0, a, dl0dx, dadx)
+        ans = (a1 * l1 - a2 * l2) / (2 * dh)
+        print("al ans  :", ans)
+        print("al CD   :", np.dot(p, dal0dx))
+        print("al Error:", (ans - np.dot(p, dal0dx)) / ans)
+
+        xi = 1e-3
+        a = -0.010895207750829469
+        lam_s1 = self.get_lam_s(l1, a1, xi)
+        lam_s2 = self.get_lam_s(l2, a2, xi)
+        ans = (lam_s1 - lam_s2) / (2 * dh)
+        ic(lam_s1, lam_s2)
+
+        dlam_sdx = self.get_dlamsdx(l0, a, dl0dx, dadx, xi)
+        dlam_sdx = np.dot(p, dlam_sdx)
+
+        print("lam_s ans  :", ans)
+        print("lam_s CD   :", dlam_sdx)
+        print("lam_s Error:", (ans - dlam_sdx) / ans)
+
+        flam_s1 = self.get_flam_s(l1, a1, xi)
+        flam_s2 = self.get_flam_s(l2, a2, xi)
+        ans = (flam_s1 - flam_s2) / (2 * dh)
+        ic(flam_s1, flam_s2)
+
+        dflam_sdx = self.get_dflamsdx(a, dadx, xi)
+        dflam_sdx = np.dot(p, dflam_sdx)
+
+        print("flam_s ans  :", ans)
+        print("flam_s CD   :", dflam_sdx)
+        print("flam_s Error:", (ans - dflam_sdx) / ans)
+
+        return
 
     def check_koiter_ab(self, lam_c, a, b, u0, u1, u2):
         K0 = self.K0
@@ -1192,8 +3187,8 @@ class TopologyAnalysis:
         ic(np.allclose(self.Kr @ u0r, fr))
 
         # check if K0 = K, G0 = G
-        K = self.get_stiffness_matrix(self.rhoE)
-        G = self.get_stress_stiffness_matrix(self.rhoE, u0)
+        K = self.get_stiffness_matrix(self.rho)
+        G = self.get_stress_stiffness_matrix(self.rho, u0)
         ic(np.allclose((K0 - K).data, 0))
         ic(np.allclose((G0 - G).data, 0))
 
@@ -1234,50 +3229,6 @@ class TopologyAnalysis:
 
         return
 
-    def get_tangent_stiffness_matrix(self, rhoE, u):
-
-        # Get the element-wise solution variables
-        ue = np.zeros((self.nelems, 8), dtype=rhoE.dtype)
-        ue[:, ::2] = u[2 * self.conn]
-        ue[:, 1::2] = u[2 * self.conn + 1]
-
-        # Compute the element stiffnesses
-        if self.ptype_G == "simp":
-            C = np.outer(rhoE**self.p + self.rho0_G, self.C0)
-        else:  # ramp
-            C = np.outer(rhoE / (1.0 + self.q * (1.0 - rhoE)) + self.rho0_G, self.C0)
-
-        C = C.reshape((self.nelems, 3, 3))
-
-        # Assemble all of the the 8 x 8 element stiffness matrix
-        Ke = np.zeros((self.nelems, 8, 8), dtype=rhoE.dtype)
-        Ke1 = np.zeros((self.nelems, 8, 8), dtype=rhoE.dtype)
-        Ke2 = np.zeros((self.nelems, 8, 8), dtype=rhoE.dtype)
-
-        Ge = np.zeros((self.nelems, 8, 8), dtype=rhoE.dtype)
-        Ge1 = np.zeros((self.nelems, 8, 8), dtype=rhoE.dtype)
-
-        for i in range(4):
-            detJ = self.detJ[:, i]
-            Be = self.Be[:, :, :, i]
-            Te = self.Te[:, :, :, :, i]
-
-            strain = np.zeros((self.nelems, 3))
-            Be_nl = np.zeros((self.nelems, 3, 8))
-
-            populate_nonlinear_strain_and_Be(Be, ue, strain, Be_nl)
-
-            Ke += detJ[:, np.newaxis, np.newaxis] * Be.transpose(0, 2, 1) @ C @ Be
-            Ke1 += detJ[:, np.newaxis, np.newaxis] * Be.transpose(0, 2, 1) @ C @ Be_nl
-            Ke2 += (
-                detJ[:, np.newaxis, np.newaxis] * Be_nl.transpose(0, 2, 1) @ C @ Be_nl
-            )
-
-            s = np.eisnum("nij,nj -> ni", C, strain)
-            G0e = np.einsum("n,ni,nijl -> njl", detJ, s, Te)
-            Ge1[:, 0::2, 0::2] += G0e
-            Ge1[:, 1::2, 1::2] += G0e
-
     def intital_Be_and_Te(self):
         # Compute gauss points
         gauss_pts = [-1.0 / np.sqrt(3.0), 1.0 / np.sqrt(3.0)]
@@ -1287,22 +3238,30 @@ class TopologyAnalysis:
         ye = self.X[self.conn, 1]
 
         # Compute Be and Te, detJ
-        Be = np.zeros((self.nelems, 3, 8, 4))
-        Te = np.zeros((self.nelems, 3, 4, 4, 4))
-        detJ = np.zeros((self.nelems, 4))
+        self.Be = np.zeros((self.nelems, 3, 8, 4))
+        self.Te = np.zeros((self.nelems, 3, 4, 4, 4))
+        self.detJ = np.zeros((self.nelems, 4))
+
+        self.detJ_kokkos = np.zeros((2, 2, self.nelems))
+        self.Be_kokkos = np.zeros((2, 2, self.nelems, 3, 8))
+        self.Te_kokkos = np.zeros((2, 2, self.nelems, 3, 4, 4))
 
         for j in range(2):
             for i in range(2):
                 xi, eta = gauss_pts[i], gauss_pts[j]
                 index = 2 * j + i
-                Bei = Be[:, :, :, index]
-                Tei = Te[:, :, :, :, index]
+                Bei = self.Be[:, :, :, index]
+                Tei = self.Te[:, :, :, :, index]
 
-                detJ[:, index] = populate_Be_and_Te(
+                self.detJ[:, index] = populate_Be_and_Te(
                     self.nelems, xi, eta, xe, ye, Bei, Tei
                 )
 
-        return Be, Te, detJ
+                self.detJ_kokkos[i, j, :] = self.detJ[:, index]
+                self.Be_kokkos[i, j, :, :, :] = Bei
+                self.Te_kokkos[i, j, :, :, :, :] = Tei
+
+        return
 
     def intital_stress_stiffness_matrix_deriv(self, rhoE, Te, detJ, psi, phi):
 
@@ -1361,7 +3320,7 @@ class TopologyAnalysis:
         np.add.at(dfdrho, self.conn, dfdrhoE[:, np.newaxis])
         dfdrho *= 0.25
 
-        return dfdrho
+        return self.fltr.apply_gradient(dfdrho, self.x)
 
     def get_stress_stiffness_matrix_uderiv(self, rhoE, psi, phi):
         """
@@ -1505,7 +3464,7 @@ class TopologyAnalysis:
         np.add.at(dfdrho, self.conn, dfdrhoE[:, np.newaxis])
         dfdrho *= 0.25
 
-        return dfdrho
+        return self.fltr.apply_gradient(dfdrho, self.x)
 
     def get_stress_stiffness_matrix_deriv(self, rhoE, u, psi, phi, solver):
         """
@@ -1667,25 +3626,24 @@ class TopologyAnalysis:
 
         return
 
-    def solve_eigenvalue_problem(self, rhoE, store=False):
+    def solve_eigenvalue_problem(self, store=False):
         """
         Compute the smallest buckling load factor BLF
         """
-
         t0 = time.time()
 
-        K = self.get_stiffness_matrix(rhoE)
-        self.Kr = self.reduce_matrix(K)
+        self.K0 = self.get_stiffness_matrix(self.rho)
+        self.Kr = self.reduce_matrix(self.K0)
 
         # Compute the solution path
-        fr = self.reduce_vector(self.f)
+        self.fr = self.reduce_vector(self.f)
         self.Kfact = linalg.factorized(self.Kr.tocsc())
-        ur = self.Kfact(fr)
+        ur = self.Kfact(self.fr)
         self.u = self.full_vector(ur)
 
         # Find the gemoetric stiffness matrix
-        G = self.get_stress_stiffness_matrix(rhoE, self.u)
-        self.Gr = self.reduce_matrix(G)
+        self.G0 = self.get_stress_stiffness_matrix(self.rho, self.u)
+        self.Gr = self.reduce_matrix(self.G0)
 
         t1 = time.time()
         self.profile["matrix assembly time"] += t1 - t0
@@ -1762,7 +3720,7 @@ class TopologyAnalysis:
 
     def compliance_derivative(self):
         dfdrho = -1.0 * self.get_stiffness_matrix_deriv(self.rhoE, self.u, self.u)
-        return self.fltr.apply_gradient(dfdrho, self.x)
+        return dfdrho
 
     def eval_ks_buckling(self, ks_rho=160.0):
         mu = 1 / self.BLF
@@ -1796,11 +3754,6 @@ class TopologyAnalysis:
                 adj = self.full_vector(adjr)
 
                 dGdx += self.get_stiffness_matrix_deriv(self.rhoE, adj, self.u)
-
-                # dGdx = self.get_stress_stiffness_matrix_deriv(
-                #     self.rhoE, self.u, self.Q[:, i], self.Q[:, i], self.Kfact
-                # )
-
                 dfdrho -= eta[i] * (dGdx + mu[i] * dKdx)
 
         elif self.deriv_type == "tensor":
@@ -1827,7 +3780,7 @@ class TopologyAnalysis:
         t1 = time.time()
         self.profile["total derivative time"] += t1 - t0
 
-        return self.fltr.apply_gradient(dfdrho, self.x)
+        return dfdrho
 
     def get_eigenvector_aggregate(self, rho, node, mode="tanh"):
         if mode == "exp":
@@ -1978,22 +3931,16 @@ class TopologyAnalysis:
         self.profile["eigenvalue solve time"] = 0.0
         self.profile["solve preconditioner count"] = 0
         self.profile["adjoint preconditioner count"] = 0
+        self.profile["koiter time"] = 0.0
 
         # Apply the filter
-        # self.rho = self.fltr.apply(self.x)
+        self.rho = self.fltr.apply(self.x)
 
         # Average the density to get the element-wise density
-        self.rhoE = 0.25 * (
-            self.rho[self.conn[:, 0]]
-            + self.rho[self.conn[:, 1]]
-            + self.rho[self.conn[:, 2]]
-            + self.rho[self.conn[:, 3]]
-        )
-
-        self.Be, self.Te, self.detJ = self.intital_Be_and_Te()
+        self.rhoE = np.mean(self.rho[self.conn[:, :4]], axis=1)
 
         # Solve the eigenvalue problem
-        self.lam, self.Q = self.solve_eigenvalue_problem(self.rhoE, store)
+        self.lam, self.Q = self.solve_eigenvalue_problem(store)
 
         # self.lam = self.lam[1:]
         # self.Q = self.Q[:, 1:]
@@ -2001,6 +3948,38 @@ class TopologyAnalysis:
         print("Eigenvalues: ", self.lam)
         if store:
             self.profile["eigenvalues"] = self.BLF.tolist()
+
+        return
+
+    def initialize_koiter(self, Q0_norm=None):
+        self.l0 = self.lam[0]
+        self.Q0 = self.Q[:, 0]
+
+        self.a, self.b, self.u1, self.u2, self.K1, self.K11, self.G1 = (
+            self.get_koiter_ab(self.rhoE, self.l0, self.u, self.Q0, Q0_norm)
+        )
+
+        return
+
+    def initialize_koiter_derivative(self):
+        t1 = time.time()
+
+        self.dl0dx = self.get_dldx()
+
+        # self.dK0dx, self.dG0dx, _ = self.get_dG0dx_dK0dx_du0dx_cs(
+        #     self.x, self.K0, self.G0, self.u, self.Q0
+        # )
+        # self.dQ0dx, self.dl0dx = self.get_dQ0dx_dl0dx(
+        #     self.x, self.K0, self.G0, self.dK0dx, self.dG0dx, self.l0, self.Q0
+        # )
+        # self.dadx = self.get_dadx_cd(self.x, self.K1, self.dQ0dx, self.Q0, dh)
+        # self.dadx = self.get_dadx(self.rhoE, self.Q0, self.K1)
+
+        self.dadx = self.get_dadx(self.rhoE, self.l0, self.Q0)
+        self.dbdx = self.get_dbdx(self.rhoE, self.l0, self.Q0)
+        t2 = time.time()
+        self.profile["koiter time"] = t2 - t1
+        ic(t2 - t1)
 
         return
 
@@ -2135,8 +4114,7 @@ class TopologyAnalysis:
         psi = self.full_vector(psir)
 
         self.rhob += self.get_stiffness_matrix_deriv(self.rhoE, psi, self.u)
-
-        self.xb += self.fltr.apply_gradient(self.rhob, self.x)
+        self.xb += self.rhob
 
         t2 = time.time()
         self.profile["total derivative time"] += t2 - t1
@@ -2169,74 +4147,72 @@ class TopologyAnalysis:
         ic(np.allclose(BLF0, self.BLF))
 
     def check_buckling(self, psi, phi, dh=1e-6):
+        # set random seed
+        np.random.seed(1234)
 
-        rho = self.fltr.apply(self.x)
+        self.initialize()
+        x = self.x
+        Kr = self.Kr
+        Gr = self.Gr
+        Q0 = self.Q[:, 0]
+        u1_norm = np.linalg.norm(Q0)
+        u1 = Q0 / u1_norm
 
-        # Average the density to get the element-wise density
-        rhoE = 0.25 * (
-            rho[self.conn[:, 0]]
-            + rho[self.conn[:, 1]]
-            + rho[self.conn[:, 2]]
-            + rho[self.conn[:, 3]]
-        )
+        # compute the full size eigenvalue problem
+        mu, phi = eigh(Gr.todense(), Kr.todense())
+        lam = -1.0 / mu
+        ic(lam[0])
 
-        K = self.get_stiffness_matrix(rhoE)
-        Kr = self.reduce_matrix(K)
+        # check if (Kr + lam * Gr) * phi = 0
+        res = (Kr + lam[0] * Gr) @ phi[:, 0]
+        ic(np.linalg.norm(res))
 
-        # Compute the solution path
-        fr = self.reduce_vector(self.f)
-        Kfact = linalg.factorized(Kr.tocsc())
-        ur = Kfact(fr)
-        u = self.full_vector(ur)
+        # check if (Gr - mu * Kr) * phi = 0
+        res = (Gr - mu[0] * Kr) @ phi[:, 0]
+        ic(np.linalg.norm(res))
 
-        # Find the gemoetric stiffness matrix
-        G = self.get_stress_stiffness_matrix(rhoE, u)
+        dKdx = self.get_stiffness_matrix_deriv(self.rhoE, u1, u1)
+        dGdx = self.get_stress_stiffness_matrix_xuderiv(self.rhoE, self.u, u1, u1)
 
-        kx = self.get_stiffness_matrix_deriv(rhoE, psi, phi)
-        gx = self.get_stress_stiffness_matrix_deriv(rhoE, u, psi, phi, Kfact)
+        dh = 1e-4
+        p = np.random.rand(self.x.size)
+        # p = np.ones(self.x.size)
+        p = p / np.linalg.norm(p)
 
-        g_f0 = np.dot(psi, G @ phi)
-        k_f0 = np.dot(psi, K @ phi)
+        x1 = x + dh * p
+        x2 = x - dh * p
+        rho1 = self.fltr.apply(x1)
+        rho2 = self.fltr.apply(x2)
 
-        p_rho = np.random.uniform(size=rho.shape)
-        rho_1 = rho + dh * p_rho
+        K1 = self.get_stiffness_matrix(rho1)
+        K2 = self.get_stiffness_matrix(rho2)
 
-        g_exact = np.dot(gx, p_rho)
-        k_exact = np.dot(kx, p_rho)
+        K1r = self.reduce_matrix(K1)
+        K2r = self.reduce_matrix(K2)
+        K1fact = linalg.factorized(K1r)
+        K2fact = linalg.factorized(K2r)
 
-        rhoE_1 = 0.25 * (
-            rho_1[self.conn[:, 0]]
-            + rho_1[self.conn[:, 1]]
-            + rho_1[self.conn[:, 2]]
-            + rho_1[self.conn[:, 3]]
-        )
+        u1r = K1fact(self.fr)
+        u2r = K2fact(self.fr)
+        u01 = self.full_vector(u1r)
+        u02 = self.full_vector(u2r)
 
-        K = self.get_stiffness_matrix(rhoE_1)
-        Kr = self.reduce_matrix(K)
+        G1 = self.get_stress_stiffness_matrix(rho1, u01)
+        G2 = self.get_stress_stiffness_matrix(rho2, u02)
 
-        # Compute the solution path
-        fr = self.reduce_vector(self.f)
-        Kfact = linalg.factorized(Kr.tocsc())
-        ur = Kfact(fr)
-        u = self.full_vector(ur)
+        K_ans = p.T @ dKdx
+        G_ans = p.T @ dGdx
 
-        # Find the gemoetric stiffness matrix
-        G = self.get_stress_stiffness_matrix(rhoE_1, u)
-        K = self.get_stiffness_matrix(rhoE_1)
+        K_cd = u1.T @ (K1 - K2) @ u1 / (2 * dh)
+        G_cd = u1.T @ (G1 - G2) @ u1 / (2 * dh)
 
-        k_f1 = np.dot(psi, K @ phi)
-        k_fd = (k_f1 - k_f0) / dh
+        print("K Exact: ", K_ans)
+        print("K CD   : ", K_cd)
+        print("K Error: ", (K_ans - K_cd) / K_cd, "\n")
 
-        print("\nK: Exact: ", k_exact)
-        print("K: FD: ", k_fd)
-        print("K: Error: ", np.abs(k_exact - k_fd) / np.abs(k_exact))
-
-        g_f1 = np.dot(psi, G @ phi)
-        g_fd = (g_f1 - g_f0) / dh
-
-        print("\nG: Exact: ", g_exact)
-        print("G: FD: ", g_fd)
-        print("G: Error: ", np.abs(g_exact - g_fd) / np.abs(g_exact))
+        print("G Exact: ", G_ans)
+        print("G CD   : ", G_cd)
+        print("G Error: ", (G_ans - G_cd) / G_cd, "\n")
 
         return
 
@@ -2342,7 +4318,7 @@ class TopologyAnalysis:
 
         return
 
-    def test_ks_buckling_derivatives(self, dh_fd=1e-4, ks_rho=30, pert=None):
+    def test_ks_buckling_derivatives(self, dh_fd=1e-4, ks_rho=160, pert=None):
         # Initialize the problem
         self.initialize(store=True)
 
@@ -2367,6 +4343,9 @@ class TopologyAnalysis:
         c2 = self.eval_ks_buckling(ks_rho)
 
         cd = (c1 - c2) / (2 * dh_fd)
+
+        self.x = x0
+        self.initialize()
 
         print("\nTotal derivative for ks-buckling:", self.deriv_type + " type")
         print("Ans:                 ", ans)
@@ -2507,33 +4486,37 @@ class TopologyAnalysis:
         fig, ax = plt.subplots()
         self.plot(self.rho, ax=ax)
 
-        # plot the nodes
-        for i in range(self.nnodes):
-            ax.scatter(self.X[i, 0], self.X[i, 1], color="k", s=1, clip_on=False)
+        # # plot the nodes
+        # for i in range(self.nnodes):
+        #     ax.scatter(self.X[i, 0], self.X[i, 1], color="k", s=1, clip_on=False)
 
-        # plot the conn
-        for i in range(self.nelems):
-            for j in range(4):
-                x0 = self.X[self.conn[i, j], 0]
-                y0 = self.X[self.conn[i, j], 1]
-                x1 = self.X[self.conn[i, (j + 1) % 4], 0]
-                y1 = self.X[self.conn[i, (j + 1) % 4], 1]
-                ax.plot([x0, x1], [y0, y1], color="k", linewidth=0.5, clip_on=False)
+        # # plot the conn
+        # for i in range(self.nelems):
+        #     for j in range(4):
+        #         x0 = self.X[self.conn[i, j], 0]
+        #         y0 = self.X[self.conn[i, j], 1]
+        #         x1 = self.X[self.conn[i, (j + 1) % 4], 0]
+        #         y1 = self.X[self.conn[i, (j + 1) % 4], 1]
+        #         ax.plot([x0, x1], [y0, y1], color="k", linewidth=0.5, clip_on=False)
 
-        # plot the bcs
-        for i, v in self.bcs.items():
-            ax.scatter(self.X[i, 0], self.X[i, 1], color="b", s=5, clip_on=False)
+        # # plot the bcs
+        # for i, v in self.bcs.items():
+        #     ax.scatter(self.X[i, 0], self.X[i, 1], color="b", s=5, clip_on=False)
 
-        for i, v in self.forces.items():
-            ax.quiver(
-                self.X[i, 0],
-                self.X[i, 1],
-                v[0],
-                v[1],
-                color="r",
-                scale=1e-3,
-                clip_on=False,
-            )
+        # plot the non-design nodes
+        # m0_X = np.array([self.X[i, :] for i in self.fltr.non_design_nodes])
+        # ax.scatter(m0_X[:, 0], m0_X[:, 1], color="blue", s=5, clip_on=False)
+
+        # for i, v in self.forces.items():
+        #     ax.quiver(
+        #         self.X[i, 0],
+        #         self.X[i, 1],
+        #         v[0],
+        #         v[1],
+        #         color="r",
+        #         scale=1e-3,
+        #         clip_on=False,
+        #     )
 
         # if index is not None:
         #     for i in index:
@@ -2689,33 +4672,140 @@ class TopologyAnalysis:
 
         return ax
 
-    def plot_u_compare(self, u1, l1, u2, l2, path=None):
+    def plot_u_compare(self, a, b, u1, u2, path=None, lam_s=None):
         # get the middle node of the index where the force is applied
         indy = 2 * np.nonzero(self.f[1::2])[0] + 1
         indy = indy[len(indy) // 2]
         indx = indy - 1
 
         fig, ax = plt.subplots(1, 2, figsize=(12, 4), tight_layout=True)
-        ax[0].plot(u1[:, indx], l1 / self.lam[0], marker="o", label="Arc-Length")
-        ax[0].plot(u2[:, indx], l2 / self.lam[0], marker="o", label="Koiter-Asymptotic")
+
+        xib0 = [0, 0.0001, 0.001, 0.01]
+
+        cb = [cw(0.0), cw(0.1), cw(0.2), cw(0.3)]
+        cr = [cw(1.0), cw(0.9), cw(0.8), cw(0.7)]
+
+        # scale = [0.4, 0.4, 0.95, 6]
+        scale = [1.8, 1.8, 1.8, 2.2]
+        u_arc = []
+        l_arc = []
+
+        # for i in range(len(xib0)):
+        #     u, l = self.arc_length_method(
+        #         Dl=self.lam[0] * 0.2, # 0.2
+        #         lmax=self.lam[0] * 5,
+        #         scale=scale[i],
+        #         u_imp=xib0[i] * self.Q[:, 0],
+        #     )
+        #     u_arc.append(u)
+        #     l_arc.append(l)
+
+        # np.save("./output/u_arc.npy", u_arc)
+        # np.save("./output/l_arc.npy", l_arc)
+
+        # u_arc = np.load("./output/u_arc.npy")
+        # l_arc = np.load("./output/l_arc.npy")
+
+        # for i in range(len(xib0)):
+        #     if xib0[i] == 0:
+        #         label = r"Arc-Length $\bar{\xi}$ = 0"
+        #     else:
+        #         label = r"Arc-Length $\bar{\xi}$ = %.e$\phi_1$" % np.abs(xib0[i])
+
+        #     ax[0].plot(
+        #         u_arc[i][:, indx],
+        #         l_arc[i] / self.lam[0],
+        #         marker="o",
+        #         label=label,
+        #         color=cb[i],
+        #     )
+        #     ax[1].plot(
+        #         u_arc[i][:, indy],
+        #         l_arc[i] / self.lam[0],
+        #         marker="o",
+        #         label=label,
+        #         color=cb[i],
+        #     )
+
+        # apply the Koiter-Asymptotic
+        xi = np.linspace(0, -5e1, 100)
+
+        # generate the Koiter-Asymptotic for different imperfection
+        u = []
+        lam = []
+        for i in range(len(xib0)):
+            xib = xib0[i] * np.linalg.norm(topo.Q[:, 0])
+
+            # compute lambda based on xi value
+            if xib == 0:
+                lam_imp = (1 + a * xi + b * xi**2) * self.lam[0]
+            else:
+                lam_imp = (xi + a * xi**2 + b * xi**3) / (xi + xib) * self.lam[0]
+
+            # compute the displacement based on lambda and xi
+            u_imp = np.zeros((lam_imp.size, topo.nvars))
+            for n in range(lam_imp.size):
+                u_imp[n, :] = lam_imp[n] * self.u + xi[n] * u1 + xi[n] ** 2 * u2
+
+            if xib == 0:
+                u_imp = np.vstack((np.zeros(topo.nvars), u_imp))
+                lam_imp = np.hstack((0, lam_imp))
+
+            # bb = -4 * a * xib
+            # cc = 4 * a * xib
+            # f = 0.5 * (-bb + np.sqrt(bb**2 - 4 * cc))
+            # lam_s = (1 - f) * self.lam[0]
+            axi = np.abs(a * xib)
+            lam_s = self.lam[0] * (1 + 2 * axi - 2 * np.sqrt(axi + axi**2))
+            ic(lam_s)
+
+            if xib0[i] == 0:
+                la = r"Koiter-Asymptotic $\bar{\xi}$ = 0"
+            else:
+                la = r"Koiter-Asymptotic $\bar{\xi}$ = %.e$\phi_1$" % np.abs(xib0[i])
+            l0 = ax[0].plot(
+                u_imp[:, indx],
+                lam_imp / self.lam[0],
+                marker="o",
+                label=la,
+                ms=2,
+                color=cr[i],
+            )
+            l2 = ax[1].plot(
+                u_imp[:, indy],
+                lam_imp / self.lam[0],
+                marker="o",
+                label=la,
+                ms=2,
+                color=cr[i],
+            )
+
+            ax[0].axhline(
+                y=lam_s / self.lam[0], color=l0[0].get_color(), linestyle="--"
+            )
+            ax[1].axhline(
+                y=lam_s / self.lam[0], color=l2[0].get_color(), linestyle="--"
+            )
+
+            u.append(u_imp)
+            lam.append(lam_imp)
+
         ax[0].set_xlabel(r"$u_x$")
         ax[0].set_ylabel(r"$\lambda/\lambda_c$")
-        ax[0].axvline(x=0, color="grey", linestyle="--")
-        ax[0].axhline(y=1, color="grey", linestyle="--")
+        # ax[0].axvline(x=0, color="grey", linestyle="--")
+        # ax[0].axhline(y=1, color="grey", linestyle="--")
         ax[0].legend()
 
-        ax[1].plot(u1[:, indy], l1 / self.lam[0], marker="o", label="Arc-Length")
-        ax[1].plot(u2[:, indy], l2 / self.lam[0], marker="o", label="Koiter-Asymptotic")
         ax[1].set_xlabel(r"$u_y$")
         ax[1].set_ylabel(r"$\lambda/\lambda_c$")
-        ax[1].axvline(x=0, color="k", linestyle="--")
-        ax[1].axhline(y=1, color="k", linestyle="--")
+        # ax[1].axvline(x=0, color="grey", linestyle="--")
+        # ax[1].axhline(y=1, color="grey", linestyle="--")
         ax[1].invert_xaxis()
         ax[1].legend()
 
         plt.savefig(path, bbox_inches="tight")
 
-        return ax
+        return u, lam, xib0
 
 
 def domain_compressed_column(nx=64, ny=128, Lx=1.0, Ly=2.0, shear_force=False):
@@ -2761,7 +4851,7 @@ def domain_compressed_column(nx=64, ny=128, Lx=1.0, Ly=2.0, shear_force=False):
                 dvmap[nx - i, j] = index
                 index += 1
 
-    non_design_nodes = index
+    num_design_vars = index
     dvmap = dvmap.flatten()
 
     # apply boundary conditions at the bottom nodes
@@ -2787,7 +4877,11 @@ def domain_compressed_column(nx=64, ny=128, Lx=1.0, Ly=2.0, shear_force=False):
             forces[nodes[nx // 2 + i + 1, ny]] = [0, -P / (2 * offset + 1)]
         forces[nodes[nx // 2, ny]] = [0, -P / (2 * offset + 1)]
 
-    return conn, X, dvmap, non_design_nodes, bcs, forces
+    non_design_nodes = []
+
+    ic(num_design_vars, len(non_design_nodes))
+
+    return conn, X, dvmap, num_design_vars, non_design_nodes, bcs, forces
 
 
 def domain_rooda_frame(nx=120, l=8.0, lfrac=0.1):
@@ -2845,42 +4939,68 @@ def domain_rooda_frame(nx=120, l=8.0, lfrac=0.1):
                 ]
                 index += 1
 
-    non_design_nodes = []
-    # for jp in range(nt - nm, nt + 1):
-    #     for ip in range(nx - nm, nx + 1):
-    #         non_design_nodes.append(ij_to_node(ip, jp))
-
+    t = 1
     bcs = {}
-    # # top left corner ---- fixed
+    non_design_nodes = []
+
+    # bottom middle ___ fixed
+    bcs[ij_to_node((nt + 1) // 2, 0)] = [0, 1]
+
+    # top middle | fixed
+    bcs[ij_to_node(nx, nx - nt // 2)] = [0, 1]
+
+    # # bottom left corner ___ fixed
     # for ip in range(nt + 1):
-    #     bcs[ij_to_node(ip, nx)] = [0, 1]
-    # non_design_nodes.append(ij_to_node(ip, nx))
-    # non_design_nodes.append(ij_to_node(ip, nx-1))
+    #     bcs[ij_to_node(ip, 0)] = [0, 1]
 
-    # bottom left corner ____ fixed
-    for ip in range(nt + 1):
-        bcs[ij_to_node(ip, 0)] = [0, 1]
+    # # top right corner | fixed
+    # for jp in range(nx - nt, nx + 1):
+    #     bcs[ij_to_node(nx, jp)] = [0, 1]
 
-    # top right corner | fixed
-    for jp in range(nx - nt, nx + 1):
-        bcs[ij_to_node(nx, jp)] = [0, 1]
+    # for jp in range(nx + 1):
+    #     for aa in range(t):
+    #         non_design_nodes.append(ij_to_node(aa, jp))
+
+    # for jp in range(nx - nt):
+    #     for aa in range(t):
+    #         non_design_nodes.append(ij_to_node(nt-aa, jp))
+
+    # for ip in range(t, nx + 1):
+    #     for aa in range(t):
+    #         non_design_nodes.append(ij_to_node(ip, nx-aa))
+
+    # for ip in range(nt + 1 - t, nx + 1):
+    #     for aa in range(t):
+    #         non_design_nodes.append(ij_to_node(ip, nx-nt + aa))
 
     forces = {}
     P = -5e-4
     P_nnodes = int(np.ceil(0.01 * nx))
     P_pst = int(np.ceil(0.2 * nx))
+
     P_pst = 0
     P_nnodes = nt + 1
+
+    P_pst = (nt + 1) // 2
+    P_nnodes = 1
+    
     for ip in range(P_pst, P_pst + P_nnodes):
         forces[ij_to_node(ip, nx)] = [0, P / P_nnodes]
 
+    # remove the non-design nodes
+    num_design_vars = nnodes  # - len(non_design_nodes)
+
+    # dvmap = np.arange(nnodes)
+    # dvmap[non_design_nodes] = -1
     dvmap = None
 
-    return conn, X, dvmap, non_design_nodes, bcs, forces
+    ic(num_design_vars, len(non_design_nodes))
+
+    return conn, X, dvmap, num_design_vars, non_design_nodes, bcs, forces
 
 
 def make_model(
-    nx=64, ny=128, Lx=1.0, Ly=2.0, rfact=4.0, N=10, shear_force=False, **kwargs
+    nx=64, ny=128, Ly=2.0, rfact=4.0, N=10, shear_force=False, **kwargs
 ):
     """
 
@@ -2893,23 +5013,30 @@ def make_model(
     N : int
         Number of eigenvalues and eigenvectors to compute
     """
-    ny = int((Ly / Lx) * nx)
 
     if kwargs.get("domain") == "column":
-        conn, X, dvmap, non_design_nodes, bcs, forces = domain_compressed_column(
-            nx=nx, ny=ny, Lx=Lx, Ly=Ly, shear_force=shear_force
+        ny = int(Ly * nx)
+        r0 = rfact * (1.0 / nx)
+        conn, X, dvmap, num_design_vars, non_design_nodes, bcs, forces = (
+            domain_compressed_column(
+                nx=nx, ny=ny, Lx=1.0, Ly=Ly, shear_force=shear_force
+            )
         )
     elif kwargs.get("domain") == "rooda":
-        conn, X, dvmap, non_design_nodes, bcs, forces = domain_rooda_frame(
-            nx=nx, l=Lx, lfrac=0.03
+        r0 = rfact * (8.0 / nx)
+        conn, X, dvmap, num_design_vars, non_design_nodes, bcs, forces = (
+            domain_rooda_frame(nx=nx, l=8.0, lfrac=0.1)
         )
+    else:
+        raise ValueError("Invalid domain")
 
     fltr = NodeFilter(
         conn,
         X,
-        r0=rfact * (Lx / nx),
+        r0=r0,
         dvmap=dvmap,
-        num_design_vars=non_design_nodes,
+        num_design_vars=num_design_vars,
+        non_design_nodes=non_design_nodes,
         projection=kwargs.get("projection"),
         beta=kwargs.get("b0"),
     )
@@ -2929,6 +5056,8 @@ def make_model(
 
 if __name__ == "__main__":
     import sys
+
+    kokkos.initialize()
 
     # enable logging
     logging.getLogger("matplotlib.font_manager").disabled = True
@@ -2952,11 +5081,11 @@ if __name__ == "__main__":
         method = "shift-invert"
         adjoint_options = {
             "lanczos_guess": True,
-            "update_guess": False,
+            "update_guess": True,
             "bs_target": 1,
         }
 
-    solver_type = "BasicLanczos"
+    solver_type = "IRAM"
     if "IRAM" in sys.argv:
         solver_type = "IRAM"
 
@@ -2965,17 +5094,19 @@ if __name__ == "__main__":
     print("solver_type = ", solver_type)
 
     topo = make_model(
-        nx=60,  # 32 x 64 mesh
-        Lx=8.0,
-        rfact=4.0,
-        N=10,
-        sigma=3.0,
+        nx=300,  # 32 x 64 mesh
+        rfact=3.0,
+        N=1,
+        sigma=15,
         solver_type=solver_type,
         adjoint_method=method,
         adjoint_options=adjoint_options,
         shear_force=False,  # True,
         deriv_type="vector",
-        domain="rooda",
+        domain="rooda",  # "column", "rooda",
+        b0=16.0,
+        p=6.0,
+        projection=True,
     )
 
     # check the buckling load factor vs sparse.linalg.eigsh
@@ -3000,8 +5131,12 @@ if __name__ == "__main__":
     # print("total derivative time", data["total derivative time"])
 
     topo.initialize()
-    topo.testR()
-    topo.testKt()
+    # topo.testR()
+    # topo.testKt()
+
+    # topo.check_derivative(topo.rhoE, topo.lam[0], topo.u, topo.Q[:, 0])
+
+    # exit()
 
     # lam0 = 1.0
     # u0 = topo.newton_raphson(lam=lam0)
@@ -3024,24 +5159,29 @@ if __name__ == "__main__":
     # # topo.plot_design("design.pdf")
     # lmax = topo.lam[0] * 5
 
-    u_list, lam_list, eigvals = topo.arc_length_method(
-        Dl=topo.lam[0] * 0.5, lmax=topo.lam[0] * 5, geteigval=True, maxiter=100
-    )
-    np.save("./output/u_list.npy", u_list)
-    np.save("./output/lam_list.npy", lam_list)
-    np.save("./output/eigvals.npy", eigvals)
+    # u_list, lam_list, eigvals = topo.arc_length_method(
+    #     Dl=topo.lam[0] * 0.2,
+    #     scale=16,
+    #     lmax=topo.lam[0] * 5,
+    #     geteigval=False,
+    #     maxiter=100,
+    #     u_imp=-1e-2 * topo.Q[:, 0],
+    # )
+    # np.save("./output/u_list.npy", u_list)
+    # np.save("./output/lam_list.npy", lam_list)
+    # np.save("./output/eigvals.npy", eigvals)
 
-    u_newton = topo.newton_raphson(lam=max(lam_list))
-    np.save("./output/u_newton.npy", u_newton)
+    # u_newton = topo.newton_raphson(lam=max(lam_list))
+    # np.save("./output/u_newton.npy", u_newton)
 
-    u_list = np.load("./output/u_list.npy")
-    lam_list = np.load("./output/lam_list.npy")
-    eigvals = np.load("./output/eigvals.npy")
-    u_newton = np.load("./output/u_newton.npy")
+    # u_list = np.load("./output/u_list.npy")
+    # lam_list = np.load("./output/lam_list.npy")
+    # eigvals = np.load("./output/eigvals.npy")
+    # u_newton = np.load("./output/u_newton.npy")
 
     # plot the u as a video that shows the buckling process
-    topo.video_u(u_list, lam_list, "arc_length.mp4", "Arc-Length")
-    topo.plot_u(u_list, lam_list, eigvals, "arc_length.pdf")
+    # topo.video_u(u_list, lam_list, "arc_length.mp4", "Arc-Length")
+    # topo.plot_u(u_list, lam_list, eigvals, "arc_length.pdf")
 
     # u1, _= topo.arc_length_method(Dl=topo.lam[0] * 0.1, lmax=lam_c)
 
@@ -3050,77 +5190,53 @@ if __name__ == "__main__":
     # lam_c = 1.71
     # u1 = topo.newton_raphson(lam=lam_c)
 
-    lam_c = topo.lam[0]
-    u0 = topo.u
-    u1 = topo.Q[:, 0]
-    print(u1.shape)
-
-    # lam_c, u1 = topo.approximate_critical_load_factor(sigma=topo.lam[0])
-
-    # u1 = topo.approximate_u1(lam_c)
-    # print("lam_c = ", lam_c)
-    # find the index where lam start to decrease for lam_list
-    # index_c = 0
-    # for i in range(1, lam_list.size):
-    #     if lam_list[i] < lam_list[i - 1]:
-    #         index_c = i
-    #         break
-    # lam_c = lam_list[index_c]
-    # u1 = u_list[index_c, :]
-
-    a, b, u1, u2 = topo.get_koiter_ab(topo.rhoE, lam_c, u0, u1)
-    topo.check_koiter_ab(lam_c, a, b, u0, u1, u2)
+    topo.initialize_koiter()
+    a = topo.a
+    b = topo.b
+    u1 = topo.u1
+    u2 = topo.u2
 
     print("a = ", a)
     print("b = ", b)
 
-    xi = np.linspace(0, -1.2e1, 40)
-    lam = (1 + a * xi + b * xi**2) * lam_c
-    u = np.zeros((lam.size, topo.nvars))
-    for i in range(lam.size):
-        u[i, :] = lam[i] * u0 + xi[i] * u1 + xi[i] ** 2 * u2
+    # generate the Koiter-Asymptotic comparison plot
+    u, lam, xib0 = topo.plot_u_compare(a, b, u1, u2, "comparsion.pdf")
 
-    # from 0 to lam_c is linear
-    lam_0 = np.linspace(0, lam_c, 20)
-    u_0 = np.zeros((lam_0.size, topo.nvars))
-    for i in range(1, lam_0.size):
-        u_0[i, :] = lam_0[i] * u0
+    # # generate the Koiter-Asymptotic video
+    # for i in range(len(u)):
+    #     ti = r"Koiter-Asymptotic $\bar{\xi}$ = %.e$\phi_1$" % np.abs(xib0[i])
+    #     topo.video_u(u[i], lam[i], r"koiter_imp_%.e.mp4" % np.abs(xib0[i]), title=ti)
 
-    # add u_0 to u and lam_0 to lam
-    u = np.vstack((u_0, u))
-    lam = np.hstack((lam_0, lam))
+    # fig, ax = plt.subplots(1, 5, figsize=(15, 5))
+    # levels = np.linspace(0.0, 1.0, 26)
+    # uu = [
+    #     u_list[lam_list.size // 4 * 1, :],
+    #     u_list[lam_list.size // 4 * 2, :],
+    #     u_list[lam_list.size // 4 * 3, :],
+    #     u_list[-1, :],
+    #     u_newton,
+    # ]
+    # for i in range(5):
+    #     ii = lam_list.size // 4 * (i + 1)
+    #     topo.plot(
+    #         topo.rho,
+    #         u=uu[i],
+    #         ax=ax[i],
+    #         levels=levels,
+    #         cmap="Greys",
+    #         extend="max",
+    #     )
+    #     if i < 3:
+    #         ax[i].title.set_text(r"Arc-Length $\lambda$" + f"= %.2f" % lam_list[ii])
+    #     elif i == 3:
+    #         ax[i].title.set_text(r"Arc-Length $\lambda$" + f"= %.2f" % lam_list[-1])
+    #     else:
+    #         ax[i].title.set_text(r"Newton-Raphson $\lambda$" + f"= %.2f" % lam_list[-1])
 
-    topo.video_u(u, lam, "koiter.mp4", "Koiter-Asymptotic")
-    topo.plot_u_compare(u_list, lam_list, u, lam, "comparsion.pdf")
+    #     ax[i].set_aspect("equal")
+    #     ax[i].set_xticks([])
+    #     ax[i].set_yticks([])
 
-    fig, ax = plt.subplots(1, 5, figsize=(15, 5))
-    levels = np.linspace(0.0, 1.0, 26)
-    uu = [
-        u_list[lam_list.size // 4 * 1, :],
-        u_list[lam_list.size // 4 * 2, :],
-        u_list[lam_list.size // 4 * 3, :],
-        u_list[-1, :],
-        u_newton,
-    ]
-    for i in range(5):
-        ii = lam_list.size // 4 * (i + 1)
-        topo.plot(
-            topo.rho,
-            u=uu[i],
-            ax=ax[i],
-            levels=levels,
-            cmap="Greys",
-            extend="max",
-        )
-        if i < 3:
-            ax[i].title.set_text(r"Arc-Length $\lambda$" + f"= %.2f" % lam_list[ii])
-        elif i == 3:
-            ax[i].title.set_text(r"Arc-Length $\lambda$" + f"= %.2f" % lam_list[-1])
-        else:
-            ax[i].title.set_text(r"Newton-Raphson $\lambda$" + f"= %.2f" % lam_list[-1])
+    # plt.savefig("u_history.pdf", bbox_inches="tight")
 
-        ax[i].set_aspect("equal")
-        ax[i].set_xticks([])
-        ax[i].set_yticks([])
-
-    plt.savefig("u_history.pdf", bbox_inches="tight")
+    kokkos.finalize()

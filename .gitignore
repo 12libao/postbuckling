@@ -35,6 +35,9 @@ output/
 *.gif
 *.svg
 .DS_Store
+*.tex
+*.tikz
+*.aux
 
 # PyInstaller
 #  Usually these files are written by a python script from a template

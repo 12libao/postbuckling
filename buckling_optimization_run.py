@@ -1,11 +1,12 @@
 import os
 
-from buckling import make_model
-from buckling_optimization import BucklingOpt
 from icecream import ic
 import mpi4py.MPI as MPI
 import numpy as np
 from paropt import ParOpt
+
+from buckling import make_model
+from buckling_optimization import BucklingOpt
 from utils import Logger, get_args
 
 
@@ -18,18 +19,45 @@ class ParOptProb(ParOpt.Problem):
 
         self.prob.topo.x[:] = 1.0
         self.prob.initialize()
+
+        # compute the Q0 norm, which is fixed for gradient check
+        if grad_check:
+            self.Q0_norm = np.linalg.norm(self.prob.topo.Q[:, 0])
+        else:
+            self.Q0_norm = None
+
         self.domain_area = self.prob.get_area()
         self.area_ub = self.args.vol_frac_ub * self.domain_area
 
         self.logger = Logger(self, grad_check, "buckling")
         self.logger.initialize_output()
 
-        self.ndvs = self.prob.topo.fltr.num_design_vars
+        # self.non_design_nodes = self.prob.topo.fltr.non_design_nodes
+        # self.design_nodes = np.delete(
+        #     np.arange(self.prob.topo.nnodes), self.non_design_nodes
+        # )
+
+        self.ndvs = self.prob.topo.fltr.num_design_vars #- len(self.non_design_nodes)
         self.ncon = len(args.confs) if isinstance(args.confs, list) else 1
 
         super().__init__(comm, nvars=self.ndvs, ncon=self.ncon)
 
         return
+
+    # def _addMat0(self, which, non_design_nodes):
+    #     assert which in ["K", "G"]
+
+    #     rho = np.zeros(self.prob.topo.nnodes)
+    #     rho[non_design_nodes] = 1.0
+
+    #     if which == "K":
+    #         K00 = self.prob.topo.get_stiffness_matrix(rho)
+    #         self.prob.topo.set_K00(K00)
+    #     elif which == "G":
+    #         G00 = self.prob.topo.get_stress_stiffness_matrix(rho)
+    #         self.prob.topo.set_G00(G00)
+
+    #     return
 
     def getVarsAndBounds(self, x, lb, ub):
         x[:] = 1.0
@@ -48,14 +76,16 @@ class ParOptProb(ParOpt.Problem):
         # Set the design variables and initialize the problem
         self.prob.topo.x[:] = x[:]
         self.prob.initialize()
+        self.prob.initialize_koiter(self.Q0_norm)
+        ic(self.prob.topo.a, self.prob.topo.b)
 
         # Extract the objective function
         if self.args.objf == "ks-buckling":
-            self.obj_scale = self.args.scale_ks_buckling
+            self.obj_scale = 10.0
             self.obj = self.prob.get_ks_buckling()
 
         elif self.args.objf == "compliance":
-            self.obj_scale = self.args.scale_compliance
+            self.obj_scale = 1e5
             self.obj = self.prob.get_compliance()
 
         elif self.args.objf == "compliance-buckling":
@@ -65,8 +95,32 @@ class ParOptProb(ParOpt.Problem):
             self.obj = self.args.w * self.c_norm + (1 - self.args.w) * self.ks_norm
 
         elif self.args.objf == "aggregate-max":
-            self.obj_scale = self.args.scale_aggregate_max
+            self.obj_scale = 1.0
             self.obj = self.prob.get_eigenvector_aggregate_max()
+
+        elif self.args.objf == "koiter-a":
+            self.obj_scale = 1.0
+            self.obj = self.prob.get_koiter_a()
+
+        elif self.args.objf == "koiter-b":
+            self.obj_scale = 1.0
+            self.obj = self.prob.get_koiter_b()
+
+        elif self.args.objf == "koiter-al0":
+            self.obj_scale = 1e-5
+            self.obj = -self.prob.get_koiter_al0()
+
+        elif self.args.objf == "koiter-lams":
+            self.obj_scale = 1.0
+            self.obj = -self.prob.get_koiter_lams(self.args.xi)
+
+        elif self.args.objf == "koiter-ks-lams":
+            self.obj_scale = 10.0
+            self.obj = self.prob.get_koiter_ks_lams(self.args.xi)
+
+        elif self.args.objf == "koiter-nlams":
+            self.obj_scale = 1.0
+            self.obj = -self.prob.get_koiter_normalized_lams(self.args.xi)
 
         self.obj *= self.obj_scale
 
@@ -84,23 +138,30 @@ class ParOptProb(ParOpt.Problem):
             self.h = self.prob.get_eigenvector_aggregate()
             con.append(1.0 - self.h / self.args.h_ub)
 
+        if "ks-buckling" in self.args.confs:
+            self.ks = self.prob.get_ks_buckling()
+            self.BLF_ks = 1.0 / self.ks
+            con.append(self.BLF_ks / self.args.BLF_ks_lb - 1.0)
+
+        if "koiter-b" in self.args.confs:
+            b = self.prob.get_koiter_b()
+            con.append(b / self.args.b_lb - 1.0)
+
         return fail, self.obj, con
 
     def evalObjConGradient(self, x, g, A):
 
         # Evaluate the gradient of the objective function
         if self.args.objf == "ks-buckling":
-            dks = self.prob.get_ks_buckling_derivative()
-            g[:] = dks * self.args.scale_ks_buckling
+            g0 = self.prob.get_ks_buckling_derivative()
 
         elif self.args.objf == "compliance":
-            dc = self.prob.get_compliance_derivative()
-            g[:] = dc * self.args.scale_compliance
+            g0 = self.prob.get_compliance_derivative()
 
         elif self.args.objf == "compliance-buckling":
             dc = self.prob.get_compliance_derivative()
             dks = self.prob.get_ks_buckling_derivative()
-            g[:] = self.args.w * (dc / self.args.c0) + (1 - self.args.w) * (
+            g0 = self.args.w * (dc / self.args.c0) + (1 - self.args.w) * (
                 dks / self.args.ks0
             )
 
@@ -108,7 +169,26 @@ class ParOptProb(ParOpt.Problem):
             self.prob.initialize_adjoint()
             self.prob.get_eigenvector_aggregate_max_derivative()
             self.prob.finalize_adjoint()
-            g[:] = self.prob.topo.xb * self.obj_scale
+
+        elif self.args.objf == "koiter-a":
+            g0 = self.prob.get_koiter_da()
+
+        elif self.args.objf == "koiter-b":
+            g0 = self.prob.get_koiter_db()
+
+        elif self.args.objf == "koiter-al0":
+            g0 = -self.prob.get_koiter_dal0()
+
+        elif self.args.objf == "koiter-lams":
+            g0 = -self.prob.get_koiter_dlams(self.args.xi)
+
+        elif self.args.objf == "koiter-ks-lams":
+            g0 = self.prob.get_koiter_ks_dlams(self.args.xi)
+
+        elif self.args.objf == "koiter-nlams":
+            g0 = -self.prob.get_koiter_normalized_dlams(self.args.xi)
+
+        g[:] = g0[:] * self.obj_scale
 
         index = 0
         if "volume" in self.args.confs:
@@ -126,42 +206,47 @@ class ParOptProb(ParOpt.Problem):
             A[index][:] = -self.prob.topo.xb / self.args.h_ub
             index += 1
 
+        if "ks-buckling" in self.args.confs:
+            dks = self.prob.get_ks_buckling_derivative()
+            A[index][:] = -dks / (self.args.BLF_ks_lb * self.ks**2)
+            index += 1
+
+        if "koiter-b" in self.args.confs:
+            dbdx = self.prob.get_koiter_db()
+            A[index][:] = dbdx / self.args.b_lb
+            index += 1
+
         self.logger.write_output()
 
         # reset sigma
-        if self.args.adjoint_method == "ad-adjoint":
-            sigma = self.args.sigma_scale * self.prob.topo.lam[0]
-            self.prob.topo.sigma = min(max(sigma, 15.0), 50.0)
-            print(f"sigma: {self.prob.topo.sigma}")
-        else:
-            self.prob.topo.sigma = self.args.sigma_scale * self.prob.topo.lam[0]
+        self.prob.topo.sigma = self.args.sigma_scale * self.prob.topo.lam[0]
 
         return False
 
 
 def settings():
     problem = {
-        "domain": "buckling",
+        "domain": "rooda",  # "column" or "rooda"
         "objf": "ks-buckling",
         "w": 0.2,  # weight for compliance-buckling
         "c0": 1e-05,  # 1e-5 compliance reference value
         "ks0": 0.06,  # buckling reference value
-        "scale_ks_buckling": 10.0,
-        "scale_compliance": 1e5,
-        "scale_aggregate_max": 1.0,
         "nx": 64,
         "yxratio": 2,
         "ks_rho": 160.0,  # from ferrari2021 paper
         "rho_agg": 100.0,
         "confs": ["volume"],
-        "vol_frac_ub": 0.3,
+        "vol_frac_ub": 0.5,
+        "BLF_ks_lb": 10.0,
+        "b_lb": 0.00008,
         "c_ub": 4.3 * 7.4e-6,
         "h_ub": 1.8,
         "lb": 1e-06,  # lower bound of design variables
         "maxiter": 1000,  # maximum number of iterations
-        "E": 1.0,  # Young's modulus
-        "nu": 0.3,  # Poisson's ratio
-        "density": 1.0,
+    }
+
+    koiter = {
+        "xi": -1e-5,
     }
 
     filer_interpolation = {
@@ -170,7 +255,7 @@ def settings():
         "ptype_G": "simp",  # ramp
         "rho0_K": 1e-6,
         "rho0_M": 1e-9,
-        "rho0_G": 1e-9,
+        "rho0_G": 1e-6,
         "r": 4.0,
         "p0": 3.0,  # initial value of p
         "q0": 5.0,  # initial value of q
@@ -187,7 +272,7 @@ def settings():
     }
 
     solver = {
-        "N": 30,
+        "N": 6,
         "solver_type": "IRAM",  # IRAM or BasicLanczos
         "adjoint_method": "shift-invert",  # "shift-invert", "ad-adjoint"
         "adjoint_options": {
@@ -208,7 +293,7 @@ def settings():
         "case_num": 0,  # job submission number for PACE
     }
 
-    settings = [problem, filer_interpolation, solver, other]
+    settings = [problem, koiter, filer_interpolation, solver, other]
 
     args = get_args(settings)
 
@@ -240,7 +325,6 @@ def create_topo_model(args):
     topo = make_model(
         nx=args.nx,
         ny=int(args.yxratio * args.nx),
-        Lx=1.0,
         Ly=args.yxratio * 1.0,
         rfact=args.r,
         N=args.N,
@@ -260,9 +344,7 @@ def create_topo_model(args):
         rtol=args.rtol,
         eig_atol=args.eig_atol,
         sigma=args.sigma,
-        E=args.E,
-        nu=args.nu,
-        density=args.density,
+        domain=args.domain,
     )
     return topo
 
@@ -295,6 +377,7 @@ def check_gradients(opt, args):
             print("\n")
     return
 
+
 def get_topo():
     args = settings()
     model = create_topo_model(args)
@@ -307,6 +390,10 @@ if __name__ == "__main__":
     # Initialize settings
     args = settings()
 
+    import kokkos
+
+    kokkos.initialize()
+
     # Create topology optimization model
     topo = create_topo_model(args)
     set_node(topo, args)
@@ -315,6 +402,7 @@ if __name__ == "__main__":
     # Check the gradients
     check_gradients(opt, args)
 
+    
     # Create the ParOpt problem
     problem = ParOptProb(MPI.COMM_SELF, opt, args)
     options = paropt_options(args)
@@ -322,6 +410,8 @@ if __name__ == "__main__":
     # Set up the optimizer
     optimizer = ParOpt.Optimizer(problem, options)
     optimizer.optimize()
+
+    kokkos.finalize()
 
     print("=====================")
     print("Optimization complete")

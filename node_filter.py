@@ -16,6 +16,7 @@ class NodeFilter:
         self,
         conn,
         X,
+        non_design_nodes: list,  # indices for nodes whose density is not controlled
         r0=1.0,
         ftype="spatial",
         dvmap=None,
@@ -29,6 +30,7 @@ class NodeFilter:
         """
         self.conn = np.array(conn)
         self.X = np.array(X)
+        self.non_design_nodes = non_design_nodes
         self.nelems = self.conn.shape[0]
         self.nnodes = int(np.max(self.conn)) + 1
         self.ftype = ftype
@@ -36,6 +38,9 @@ class NodeFilter:
 
         if dvmap is not None and num_design_vars is not None:
             self.dvmap = dvmap
+            self.num_design_vars = num_design_vars
+        elif dvmap is None and num_design_vars is not None:
+            self.dvmap = None
             self.num_design_vars = num_design_vars
         else:
             self.dvmap = None
@@ -167,6 +172,13 @@ class NodeFilter:
             x = x[self.dvmap]
             x[self.dvmap <= -1] = 1.0
 
+        # if self.dvmap is None and self.non_design_nodes is not None:
+        #     x0 = np.zeros(self.nnodes)
+        #     x0[self.non_design_nodes] = 1.0
+        #     design_nodes = np.where(x0 == 0.0)[0]
+        #     x0[design_nodes] = x
+        #     x = x0
+
         if self.F is not None:
             rho = self.F @ x
         else:
@@ -187,6 +199,13 @@ class NodeFilter:
         if self.dvmap is not None:
             x = x[self.dvmap]
             x[self.dvmap <= -1] = 1.0
+
+        # if self.dvmap is None and self.non_design_nodes is not None:
+        #     x0 = np.zeros(self.nnodes)
+        #     x0[self.non_design_nodes] = 1.0
+        #     design_nodes = np.where(x0 == 0.0)[0]
+        #     x0[design_nodes] = x
+        #     x = x0
 
         if self.projection:
             if self.F is not None:
