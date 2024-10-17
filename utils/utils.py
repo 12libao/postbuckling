@@ -408,19 +408,26 @@ class Logger:
             self.foi["lam"] = self.prob.topo.lam[0]
         self.foi["volume"] = self.paropt.vol_frac
 
-        if "compliance" in self.args.confs:
-            self.foi["compliance"] = self.paropt.c
+        # if "compliance" in self.args.confs:
+        #     self.foi["c"] = self.paropt.c
 
         # if "ks-buckling" in self.args.confs:
         #     self.foi["ks"] = self.paropt.BLF_ks
 
-        if self.args.objf == "ks-buckling" or self.args.objf == "koiter-ks-lams":
+        if (
+            self.args.objf == "ks-buckling"
+            or self.args.objf == "koiter-ks-lams"
+            or self.args.objf == "koiter-ks-lams-b"
+        ):
             self.foi["BLF0"] = self.paropt.prob.topo.BLF[0]
 
         if "aggregate" in self.args.confs:
             self.foi["aggregate"] = self.paropt.h
 
-        if self.args.objf == "compliance-buckling":
+        if (
+            self.args.objf == "compliance-buckling"
+            or self.args.objf == "koiter-ks-lams-bc"
+        ):
             self.foi["c/c0"] = self.paropt.c_norm
             self.foi["ks/ks0"] = self.paropt.ks_norm
             self.foi["BLF0"] = self.prob.topo.BLF[0]
@@ -437,7 +444,7 @@ class Logger:
                 Log.log("%10s" % k, end="")
 
             Log.log(
-                "%10s%10s%10s%10s%10s" % ("1e-5", "1e-4", "1e-3", "1e-2", "1e-1"),
+                "%10s%10s%10s%10s" % ("1e-4", "1e-3", "1e-2", "1e-1"),
                 end="",
             )
 
@@ -451,11 +458,25 @@ class Logger:
             if not isinstance(v, str):
                 Log.log("%10.3f" % v, end="")
 
-        xib = [1e-5, 1e-4, 1e-3, 1e-2, 1e-1]
+        xib = [1e-4, 1e-3, 1e-2, 1e-1]
+
         for xi in xib:
             xi *= np.linalg.norm(self.prob.topo.Q0)
-            aa = np.abs(self.prob.topo.a * xi)
-            lam_s = self.prob.topo.lam[0] * (1 + 2 * aa - 2 * np.sqrt(aa + aa**2))
+
+            if (
+                self.args.objf
+                in {"koiter-ks-lams-b", "koiter-ks-lams-bc", "compliance-buckling"}
+                or "koiter-b" in self.args.confs
+            ):
+                lam_s = self.prob.topo.get_lams_b(
+                    self.prob.topo.lam[0], self.prob.topo.b, xi
+                )
+                if lam_s < 1e-5:
+                    lam_s = 0
+            else:
+                aa = np.abs(self.prob.topo.a * xi)
+                lam_s = self.prob.topo.lam[0] * (1 + 2 * aa - 2 * np.sqrt(aa + aa**2))
+
             Log.log("%10.3f" % lam_s, end="")
 
         Log.log("%13.3e%13.3e" % (self.prob.topo.a, self.prob.topo.b), end="")
@@ -681,6 +702,10 @@ class Logger:
 
         # if "sigma_scale" in self.args:
         #     self.args.prefix = self.args.prefix + ", sc=" + str(self.args.sigma_scale)
+
+        # use secific format for xi
+        if "xi" in self.args and self.args.objf != "ks-buckling":
+            self.args.prefix = self.args.prefix + ", xi=" + f"{self.args.xi:.0e}"
 
         # # if args have kappa, add it to the prefix
         # if "kappa" in self.args:

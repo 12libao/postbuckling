@@ -181,7 +181,7 @@ class TopologyAnalysis:
 
         self.x = np.ones(self.fltr.num_design_vars)
         self.xb = np.zeros(self.x.shape)
-        
+
         # # Set the initial design variable values
         # def _read_vtk(file, nx, ny):
         #     x, rho = [], []
@@ -308,7 +308,7 @@ class TopologyAnalysis:
             Ke += detJ.reshape(-1, 1, 1) * Be.transpose(0, 2, 1) @ C @ Be
 
         K = sparse.csc_matrix((Ke.flatten(), (self.i, self.j)))  # column format
-        
+
         return K
 
     def get_stress_stiffness_matrix(self, rho, u):
@@ -1433,7 +1433,7 @@ class TopologyAnalysis:
         eta = np.exp(ks_rho * (mu - c))
         eta = eta / np.sum(eta)
 
-        dfdrho = np.zeros(self.nnodes)
+        dfdx = np.zeros(self.x.size)
         if self.deriv_type == "vector":
             for i in range(self.N):
                 dKdx = self.get_stiffness_matrix_deriv(
@@ -1452,13 +1452,12 @@ class TopologyAnalysis:
 
                 dGdx += self.get_stiffness_matrix_deriv(self.rhoE, adj, self.u)
                 # dfdrho -= eta[i] * (dGdx + mu[i] * dKdx)
-                dldx = self.get_dldx(i)
 
                 t1 = self.BLF[i] * (2 - (2 * x + 1) / np.sqrt(x**2 + x))
 
                 dldx = self.BLF[i] * (dKdx + self.BLF[i] * dGdx)
-                dfdrho += eta[i] * (-1/lams[i]**2) * dldx * t0
-                dfdrho -= eta[i] * (-1/lams[i]**2) * dadx * xi * t1
+                dfdx += eta[i] * (-1/lams[i]**2) * dldx * t0
+                dfdx -= eta[i] * (-1/lams[i]**2) * dadx * xi * t1
 
         elif self.deriv_type == "tensor":
 
@@ -1484,16 +1483,16 @@ class TopologyAnalysis:
             )
             dGdx += self.get_stiffness_matrix_deriv(self.rhoE, adj, self.u)
 
-            dfdrho += (dGdx + dKdx) * t0
+            dfdx += (dGdx + dKdx) * t0
 
             for i in range(self.N):
                 t1 = self.BLF[i] * (2 - (2 * x + 1) / np.sqrt(x**2 + x))
-                dfdrho += eta[i] / lams[i]**2 * dadx * xi * t1
+                dfdx += eta[i] / lams[i]**2 * dadx * xi * t1
 
         time1 = time.time()
         self.profile["total derivative time"] += time1 - time0
 
-        return dfdrho
+        return dfdx
 
     def get_flam_s(self, lam_c, a, xi=1e-3):
         return self.get_lam_s(lam_c, a, xi) / lam_c
@@ -1516,6 +1515,258 @@ class TopologyAnalysis:
         x = np.abs(a * xi)
         tmp = 2 - (2 * x + 1) / np.sqrt(x**2 + x)
         return -tmp * dadx * xi
+
+    def get_lams_b(self, lamc, kb, xib=1e-3):
+        a = 1.0
+        c = 3
+        d = -1
+
+        if kb < 0:
+            b = -27 / 4 * kb * xib**2 - 3
+        else:
+            b = 27 / 4 * kb * xib**2 - 3
+
+        p = (3 * a * c - b**2) / (3 * a**2)
+        q = (2 * b**3 - 9 * a * b * c + 27 * a**2 * d) / (27 * a**3)
+        D = (q / 2)**2 + (p / 3)**3
+
+        print("D: ", D)
+
+        if D > 0:
+            u = np.cbrt(-q / 2 + np.sqrt(D))
+            v = np.cbrt(-q / 2 - np.sqrt(D))
+            t0 = u + v - b / (3 * a)
+        else:
+            theta = np.arccos(-q / 2 * np.sqrt(-27 / p**3))
+            t0 = 2 * np.sqrt(-p / 3) * np.cos(theta / 3) - b / (3 * a)
+
+        return lamc * t0
+
+    def get_ks_lams_b(self, kb, xib=1e-3, ks_rho=160.0):
+        lams = self.get_lams_b(self.BLF, kb, xib)
+        mu = 1 / lams
+        c = max(mu)
+        eta = np.exp(ks_rho * (mu-c))
+        ks_min = c + np.log(np.sum(eta)) / ks_rho    
+        return ks_min
+
+    def get_dlams_b(self, lamc, kb, dldx, dkbdx, xib=1e-3):
+        a = 1.0     
+        c = 3
+        d = -1
+
+        if kb < 0:
+            b = - 27 / 4 * kb * xib**2 - 3
+        else:
+            b = 27 / 4 * kb * xib**2 - 3
+
+        p = (3 * a * c - b**2) / (3 * a**2)
+        q = (2 * b**3 - 9 * a * b * c + 27 * a**2 * d) / (27 * a**3)
+        D = (q / 2)**2 + (p / 3)**3
+
+        if D > 0:
+            u = np.cbrt(-q / 2 + np.sqrt(D))
+            v = np.cbrt(-q / 2 - np.sqrt(D))
+            t0 = u + v - b / (3 * a)
+        else:
+            w = -q / 2 * np.sqrt(-27 / p**3)
+            theta = np.arccos(w)
+            t0 = 2 * np.sqrt(-p / 3) * np.cos(theta / 3) - b / (3 * a)
+
+        def df_dq():
+            if D > 0:
+                # Derivative of discriminant D with respect to q
+                dD_dq = q / 2
+
+                # Derivatives of a1 and a2 with respect to q
+                da1_dq = -1 / 2 + (1 / 2) * (dD_dq / np.sqrt(D))
+                da2_dq = -1 / 2 - (1 / 2) * (dD_dq / np.sqrt(D))
+
+                # Applying the chain rule to cube roots
+                b1 = (1 / (3 * u**2)) * da1_dq
+                b2 = (1 / (3 * v**2)) * da2_dq
+
+                dfdq = b1 + b2
+            else:
+                dtheta_da1 = -1 / np.sqrt(1 - w**2)
+                da1_dq = -1 / 2 * np.sqrt(-27 / p**3)
+                dtheta_dq = dtheta_da1 * da1_dq
+
+                dxdtheta = 2 * np.sqrt(-p / 3) * (-np.sin(theta / 3) / 3)
+                dfdq = dxdtheta * dtheta_dq
+
+            return dfdq
+
+        def df_dp():
+            if D > 0:
+                # Derivative of discriminant D with respect to p
+                dD_dp = (p**2) / 9
+
+                # Derivatives of a1 and a2 with respect to p
+                da1_dp = (1 / 2) * (dD_dp / np.sqrt(D))
+                da2_dp = -(1 / 2) * (dD_dp / np.sqrt(D))
+
+                # Applying the chain rule to cube roots
+                b1 = (1 / (3 * u**2)) * da1_dp
+                b2 = (1 / (3 * v**2)) * da2_dp
+
+                dfdp = b1 + b2
+            else:
+                dtheta_da1 = -1 / np.sqrt(1 - w**2)
+                da1_dp = -q / 2 * (1 / 2) / np.sqrt(-27 / p**3) * 81 * p ** (-4)
+                dtheta_dp = dtheta_da1 * da1_dp
+
+                dxdtheta = 2 * np.sqrt(-p / 3) * (-np.sin(theta / 3) / 3)
+                df_dp0 = 1 / np.sqrt(-p / 3) * (-1 / 3) * np.cos(theta / 3)
+                dfdp = dxdtheta * dtheta_dp + df_dp0
+
+            return dfdp
+
+        dfdp = df_dp()
+        dfdq = df_dq()
+
+        dpdb = -2 * b / (3 * a**2)
+        dqdb = (6 * b**2 - 9 * a * c) / (27 * a**3)
+
+        dfdb = dfdp * dpdb + dfdq * dqdb - 1 / (3 * a)
+
+        if kb < 0:
+            dbdkb = -27 / 4 * xib**2
+        else:
+            dbdkb = 27 / 4 * xib**2
+            
+        t1 = dfdb * dbdkb
+
+        return t0 * dldx + lamc * t1 * dkbdx
+
+    def get_ks_lams_b_derivatives(self, kb, dkbdx, xib=1e-3, ks_rho=160.0):
+        a = 1.0
+        c = 3
+        d = -1
+
+        if kb < 0:
+            b = -27 / 4 * kb * xib**2 - 3
+        else:
+            b = 27 / 4 * kb * xib**2 - 3
+
+        p = (3 * a * c - b**2) / (3 * a**2)
+        q = (2 * b**3 - 9 * a * b * c + 27 * a**2 * d) / (27 * a**3)
+        D = (q / 2)**2 + (p / 3)**3
+
+        if D > 0:
+            u = np.cbrt(-q / 2 + np.sqrt(D))
+            v = np.cbrt(-q / 2 - np.sqrt(D))
+            t0 = u + v - b / (3 * a)
+        else:
+            w = -q / 2 * np.sqrt(-27 / p**3)
+            theta = np.arccos(w)
+            t0 = 2 * np.sqrt(-p / 3) * np.cos(theta / 3) - b / (3 * a)
+
+        def df_dq():
+            if D > 0:
+                # Derivative of discriminant D with respect to q
+                dD_dq = q / 2
+
+                # Derivatives of a1 and a2 with respect to q
+                da1_dq = -1 / 2 + (1 / 2) * (dD_dq / np.sqrt(D))
+                da2_dq = -1 / 2 - (1 / 2) * (dD_dq / np.sqrt(D))
+
+                # Applying the chain rule to cube roots
+                b1 = (1 / (3 * u**2)) * da1_dq
+                b2 = (1 / (3 * v**2)) * da2_dq
+
+                dfdq = b1 + b2
+            else:
+                dtheta_da1 = -1 / np.sqrt(1 - w**2)
+                da1_dq = -1 / 2 * np.sqrt(-27 / p**3)
+                dtheta_dq = dtheta_da1 * da1_dq
+
+                dxdtheta = 2 * np.sqrt(-p / 3) * (-np.sin(theta / 3) / 3)
+                dfdq = dxdtheta * dtheta_dq
+
+            return dfdq
+
+        def df_dp():
+            if D > 0:
+                # Derivative of discriminant D with respect to p
+                dD_dp = (p**2) / 9
+
+                # Derivatives of a1 and a2 with respect to p
+                da1_dp = (1 / 2) * (dD_dp / np.sqrt(D))
+                da2_dp = -(1 / 2) * (dD_dp / np.sqrt(D))
+
+                # Applying the chain rule to cube roots
+                b1 = (1 / (3 * u**2)) * da1_dp
+                b2 = (1 / (3 * v**2)) * da2_dp
+
+                dfdp = b1 + b2
+            else:
+                dtheta_da1 = -1 / np.sqrt(1 - w**2)
+                da1_dp = -q / 2 * (1 / 2) / np.sqrt(-27 / p**3) * 81 * p ** (-4)
+                dtheta_dp = dtheta_da1 * da1_dp
+
+                dxdtheta = 2 * np.sqrt(-p / 3) * (-np.sin(theta / 3) / 3)
+                df_dp0 = 1 / np.sqrt(-p / 3) * (-1 / 3) * np.cos(theta / 3)
+                dfdp = dxdtheta * dtheta_dp + df_dp0
+
+            return dfdp
+
+        dfdp = df_dp()
+        dfdq = df_dq()
+
+        dpdb = -2 * b / (3 * a**2)
+        dqdb = (6 * b**2 - 9 * a * c) / (27 * a**3)
+
+        dfdb = dfdp * dpdb + dfdq * dqdb - 1 / (3 * a)
+
+        if kb < 0:
+            dbdkb = -27 / 4 * xib**2
+        else:
+            dbdkb = 27 / 4 * xib**2
+            
+        t1 = dfdb * dbdkb
+
+        time0 = time.time()
+
+        lams = self.BLF * t0
+        mu = 1 / lams
+        c = max(mu)
+        eta = np.exp(ks_rho * (mu-c))
+        eta = eta / np.sum(eta)
+
+        dfdx = np.zeros(self.x.size)
+
+        eta_Q = (
+            -eta[:, np.newaxis]/lams[:, np.newaxis] ** 2
+            * self.BLF[:, np.newaxis]
+            * self.Q.T
+        ).T
+        eta_BLF_Q = (-eta[:, np.newaxis] /lams[:, np.newaxis] ** 2 * self.BLF[:, np.newaxis]**2 * self.Q.T).T
+
+        dKdx = self.get_stiffness_matrix_deriv(self.rhoE, eta_Q, self.Q)
+
+        dfds = self.intital_stress_stiffness_matrix_deriv(
+            self.rhoE, self.Te, self.detJ, eta_BLF_Q, self.Q
+        )
+        dGdu = self.get_stress_stiffness_matrix_uderiv_tensor(dfds, self.Be)
+        dGdur = self.reduce_vector(dGdu)
+        adjr = -self.Kfact(dGdur)
+        adj = self.full_vector(adjr)
+
+        dGdx = self.get_stress_stiffness_matrix_xderiv_tensor(
+            self.rhoE, self.u, dfds, self.Be
+        )
+        dGdx += self.get_stiffness_matrix_deriv(self.rhoE, adj, self.u)
+
+        dfdx += (dGdx + dKdx) * t0
+
+        for i in range(self.N):
+            dfdx -= eta[i] / lams[i]**2 * self.BLF[i] * t1 * dkbdx
+
+        time1 = time.time()
+        self.profile["total derivative time"] += time1 - time0
+
+        return dfdx
 
     def get_dldx(self, i=0):
         """
@@ -3736,7 +3987,7 @@ class TopologyAnalysis:
         eta = np.exp(ks_rho * (mu - c))
         eta = eta / np.sum(eta)
 
-        dfdrho = np.zeros(self.nnodes)
+        dfdx = np.zeros(self.x.shape)
         if self.deriv_type == "vector":
             for i in range(self.N):
                 dKdx = self.get_stiffness_matrix_deriv(
@@ -3754,7 +4005,7 @@ class TopologyAnalysis:
                 adj = self.full_vector(adjr)
 
                 dGdx += self.get_stiffness_matrix_deriv(self.rhoE, adj, self.u)
-                dfdrho -= eta[i] * (dGdx + mu[i] * dKdx)
+                dfdx -= eta[i] * (dGdx + mu[i] * dKdx)
 
         elif self.deriv_type == "tensor":
             eta_Q = (eta[:, np.newaxis] * self.Q.T).T
@@ -3774,13 +4025,12 @@ class TopologyAnalysis:
                 self.rhoE, self.u, dfds, self.Be
             )
             dGdx += self.get_stiffness_matrix_deriv(self.rhoE, adj, self.u)
-
-            dfdrho -= dGdx + dKdx
+            dfdx -= dGdx + dKdx
 
         t1 = time.time()
         self.profile["total derivative time"] += t1 - t0
 
-        return dfdrho
+        return dfdx
 
     def get_eigenvector_aggregate(self, rho, node, mode="tanh"):
         if mode == "exp":

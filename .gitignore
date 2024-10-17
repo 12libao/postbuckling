@@ -27,6 +27,7 @@ share/python-wheels/
 *.egg
 MANIFEST
 output/
+out/
 *.mp4
 *.png
 *.pdf

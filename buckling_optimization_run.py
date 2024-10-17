@@ -32,32 +32,12 @@ class ParOptProb(ParOpt.Problem):
         self.logger = Logger(self, grad_check, "buckling")
         self.logger.initialize_output()
 
-        # self.non_design_nodes = self.prob.topo.fltr.non_design_nodes
-        # self.design_nodes = np.delete(
-        #     np.arange(self.prob.topo.nnodes), self.non_design_nodes
-        # )
-
-        self.ndvs = self.prob.topo.fltr.num_design_vars #- len(self.non_design_nodes)
+        self.ndvs = self.prob.topo.fltr.num_design_vars
         self.ncon = len(args.confs) if isinstance(args.confs, list) else 1
 
         super().__init__(comm, nvars=self.ndvs, ncon=self.ncon)
 
         return
-
-    # def _addMat0(self, which, non_design_nodes):
-    #     assert which in ["K", "G"]
-
-    #     rho = np.zeros(self.prob.topo.nnodes)
-    #     rho[non_design_nodes] = 1.0
-
-    #     if which == "K":
-    #         K00 = self.prob.topo.get_stiffness_matrix(rho)
-    #         self.prob.topo.set_K00(K00)
-    #     elif which == "G":
-    #         G00 = self.prob.topo.get_stress_stiffness_matrix(rho)
-    #         self.prob.topo.set_G00(G00)
-
-    #     return
 
     def getVarsAndBounds(self, x, lb, ub):
         x[:] = 1.0
@@ -77,7 +57,6 @@ class ParOptProb(ParOpt.Problem):
         self.prob.topo.x[:] = x[:]
         self.prob.initialize()
         self.prob.initialize_koiter(self.Q0_norm)
-        ic(self.prob.topo.a, self.prob.topo.b)
 
         # Extract the objective function
         if self.args.objf == "ks-buckling":
@@ -118,6 +97,20 @@ class ParOptProb(ParOpt.Problem):
             self.obj_scale = 10.0
             self.obj = self.prob.get_koiter_ks_lams(self.args.xi)
 
+        elif self.args.objf == "koiter-lams-b":
+            self.obj_scale = 1.0
+            self.obj = -self.prob.get_koiter_lams_b(self.args.xi)
+
+        elif self.args.objf == "koiter-ks-lams-b":
+            self.obj_scale = 10.0
+            self.obj = self.prob.get_koiter_ks_lams_b(self.args.xi)
+
+        elif self.args.objf == "koiter-ks-lams-bc":
+            self.obj_scale = 10.0
+            self.c_norm = self.prob.get_compliance() / self.args.c0
+            self.ks_norm = self.prob.get_koiter_ks_lams_b(self.args.xi) / self.args.ks0
+            self.obj = self.args.w * self.c_norm + (1 - self.args.w) * self.ks_norm
+
         elif self.args.objf == "koiter-nlams":
             self.obj_scale = 1.0
             self.obj = -self.prob.get_koiter_normalized_lams(self.args.xi)
@@ -142,6 +135,10 @@ class ParOptProb(ParOpt.Problem):
             self.ks = self.prob.get_ks_buckling()
             self.BLF_ks = 1.0 / self.ks
             con.append(self.BLF_ks / self.args.BLF_ks_lb - 1.0)
+
+        if "koiter-a" in self.args.confs:
+            a = self.prob.get_koiter_a()
+            con.append(1.0 - a / self.args.a_ub)
 
         if "koiter-b" in self.args.confs:
             b = self.prob.get_koiter_b()
@@ -185,6 +182,19 @@ class ParOptProb(ParOpt.Problem):
         elif self.args.objf == "koiter-ks-lams":
             g0 = self.prob.get_koiter_ks_dlams(self.args.xi)
 
+        elif self.args.objf == "koiter-lams-b":
+            g0 = -self.prob.get_koiter_dlams_b(self.args.xi)
+
+        elif self.args.objf == "koiter-ks-lams-b":
+            g0 = self.prob.get_koiter_ks_dlams_b(self.args.xi)
+
+        elif self.args.objf == "koiter-ks-lams-bc":
+            dc = self.prob.get_compliance_derivative()
+            dks = self.prob.get_koiter_ks_dlams_b(self.args.xi)
+            g0 = self.args.w * (dc / self.args.c0) + (1 - self.args.w) * (
+                dks / self.args.ks0
+            )
+
         elif self.args.objf == "koiter-nlams":
             g0 = -self.prob.get_koiter_normalized_dlams(self.args.xi)
 
@@ -211,6 +221,11 @@ class ParOptProb(ParOpt.Problem):
             A[index][:] = -dks / (self.args.BLF_ks_lb * self.ks**2)
             index += 1
 
+        if "koiter-a" in self.args.confs:
+            da = self.prob.get_koiter_da()
+            A[index][:] = -da / self.args.a_ub
+            index += 1
+
         if "koiter-b" in self.args.confs:
             dbdx = self.prob.get_koiter_db()
             A[index][:] = dbdx / self.args.b_lb
@@ -228,7 +243,7 @@ def settings():
     problem = {
         "domain": "rooda",  # "column" or "rooda"
         "objf": "ks-buckling",
-        "w": 0.2,  # weight for compliance-buckling
+        "w": 0.2,  # weight for compliance
         "c0": 1e-05,  # 1e-5 compliance reference value
         "ks0": 0.06,  # buckling reference value
         "nx": 64,
@@ -238,6 +253,7 @@ def settings():
         "confs": ["volume"],
         "vol_frac_ub": 0.5,
         "BLF_ks_lb": 10.0,
+        "a_ub": 1e-4,
         "b_lb": 0.00008,
         "c_ub": 4.3 * 7.4e-6,
         "h_ub": 1.8,
@@ -402,7 +418,6 @@ if __name__ == "__main__":
     # Check the gradients
     check_gradients(opt, args)
 
-    
     # Create the ParOpt problem
     problem = ParOptProb(MPI.COMM_SELF, opt, args)
     options = paropt_options(args)
