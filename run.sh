@@ -8,13 +8,13 @@
 
 # python buckling_optimization_run.py --domain column --objf ks-buckling --confs volume compliance --vol-frac-ub 0.3 --nx 200 --r 4 --N 6 --c-ub 2 --grad-check
 
-# python buckling_optimization_run.py --domain column --objf ks-buckling --confs volume compliance koiter-b --vol-frac-ub 0.3 --nx 100 --r 4 --N 6 --c-ub 2 --grad-check --b-lb 0
+python buckling_optimization_run.py --domain column --objf ks-buckling --confs volume compliance koiter-b --vol-frac-ub 0.3 --nx 100 --r 4 --N 6 --c-ub 2 --grad-check --b-lb=-1e-5
 
 # python buckling_optimization_run.py --domain column --objf koiter-ks-lams-b --confs volume --vol-frac-ub 0.3 --nx 100 --r 3 --N 6 --xi 1e-4 --grad-check
 
 # python buckling_optimization_run.py --domain column --objf koiter-ks-lams-b --confs volume compliance --vol-frac-ub 0.3 --nx 100 --r 3 --N 6 --xi 1e-3 --grad-check
 
-python buckling_optimization_run.py --domain column --objf koiter-ks-lamc-b --confs volume compliance --vol-frac-ub 0.3 --nx 100 --r 3 --N 6 --xi 1e-3 --grad-check
+# python buckling_optimization_run.py --domain column --objf koiter-ks-lamc-b --confs volume compliance --vol-frac-ub 0.3 --nx 100 --r 3 --N 6 --xi 1e-3 --grad-check
 
 # python buckling_optimization_run.py --domain column --objf koiter-ks-lams-bc --confs volume --vol-frac-ub 0.3 --nx 100 --r 3 --N 6 --xi 1e-1 --grad-check
 
