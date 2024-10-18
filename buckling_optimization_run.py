@@ -111,6 +111,10 @@ class ParOptProb(ParOpt.Problem):
             self.ks_norm = self.prob.get_koiter_ks_lams_b(self.args.xi) / self.args.ks0
             self.obj = self.args.w * self.c_norm + (1 - self.args.w) * self.ks_norm
 
+        elif self.args.objf == "koiter-ks-lamc-b":
+            self.obj_scale = 10.0
+            self.obj = self.prob.get_koiter_ks_lamc_b()
+
         elif self.args.objf == "koiter-nlams":
             self.obj_scale = 1.0
             self.obj = -self.prob.get_koiter_normalized_lams(self.args.xi)
@@ -142,7 +146,7 @@ class ParOptProb(ParOpt.Problem):
 
         if "koiter-b" in self.args.confs:
             b = self.prob.get_koiter_b()
-            con.append(b / self.args.b_lb - 1.0)
+            con.append(b - self.args.b_lb)
 
         return fail, self.obj, con
 
@@ -195,6 +199,9 @@ class ParOptProb(ParOpt.Problem):
                 dks / self.args.ks0
             )
 
+        elif self.args.objf == "koiter-ks-lamc-b":
+            g0 = self.prob.get_koiter_ks_dlamc_b()
+
         elif self.args.objf == "koiter-nlams":
             g0 = -self.prob.get_koiter_normalized_dlams(self.args.xi)
 
@@ -228,7 +235,7 @@ class ParOptProb(ParOpt.Problem):
 
         if "koiter-b" in self.args.confs:
             dbdx = self.prob.get_koiter_db()
-            A[index][:] = dbdx / self.args.b_lb
+            A[index][:] = dbdx
             index += 1
 
         self.logger.write_output()
@@ -255,7 +262,7 @@ def settings():
         "BLF_ks_lb": 10.0,
         "a_ub": 1e-4,
         "b_lb": 0.00008,
-        "c_ub": 4.3 * 7.4e-6,
+        "c_ub": 4.3,
         "h_ub": 1.8,
         "lb": 1e-06,  # lower bound of design variables
         "maxiter": 1000,  # maximum number of iterations
@@ -312,6 +319,7 @@ def settings():
     settings = [problem, koiter, filer_interpolation, solver, other]
 
     args = get_args(settings)
+    args.c_ub *= 7.4e-6
 
     return args
 

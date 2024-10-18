@@ -218,3 +218,10 @@ class BucklingOpt:
             xi = xi * Q0_norm
         db = self.get_dbdx()
         return self.topo.get_ks_lams_b_derivatives(self.b, db, xi, self.ks_rho)
+
+    def get_koiter_ks_lamc_b(self):
+        return self.topo.get_ks_lamc_b(self.b, self.ks_rho)
+
+    def get_koiter_ks_dlamc_b(self):
+        db = self.get_dbdx()
+        return self.topo.get_ks_lamc_b_derivatives(self.b, db, self.ks_rho)

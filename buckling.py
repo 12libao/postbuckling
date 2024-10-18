@@ -10,12 +10,8 @@ import functools
 import platform
 
 import eigenvector_derivatives as eig_deriv
-from eigenvector_derivatives import (
-    IRAM,
-    BasicLanczos,
-    SpLuOperator,
-    eval_adjoint_residual_norm,
-)
+from eigenvector_derivatives import (IRAM, BasicLanczos, SpLuOperator,
+                                     eval_adjoint_residual_norm)
 from icecream import ic
 from joblib import Parallel, delayed
 from matplotlib.animation import FuncAnimation
@@ -1415,8 +1411,8 @@ class TopologyAnalysis:
         lams = self.get_lam_s(self.BLF, a, xi)
         mu = 1 / lams
         c = max(mu)
-        eta = np.exp(ks_rho * (mu-c))
-        ks_min = c + np.log(np.sum(eta)) / ks_rho    
+        eta = np.exp(ks_rho * (mu - c))
+        ks_min = c + np.log(np.sum(eta)) / ks_rho
         return ks_min
 
     def get_ks_lams_derivatives(self, a, dadx, xi=1e-3, ks_rho=160.0):
@@ -1456,17 +1452,23 @@ class TopologyAnalysis:
                 t1 = self.BLF[i] * (2 - (2 * x + 1) / np.sqrt(x**2 + x))
 
                 dldx = self.BLF[i] * (dKdx + self.BLF[i] * dGdx)
-                dfdx += eta[i] * (-1/lams[i]**2) * dldx * t0
-                dfdx -= eta[i] * (-1/lams[i]**2) * dadx * xi * t1
+                dfdx += eta[i] * (-1 / lams[i] ** 2) * dldx * t0
+                dfdx -= eta[i] * (-1 / lams[i] ** 2) * dadx * xi * t1
 
         elif self.deriv_type == "tensor":
 
             eta_Q = (
-                -eta[:, np.newaxis]/lams[:, np.newaxis] ** 2
+                -eta[:, np.newaxis]
+                / lams[:, np.newaxis] ** 2
                 * self.BLF[:, np.newaxis]
                 * self.Q.T
             ).T
-            eta_BLF_Q = (-eta[:, np.newaxis] /lams[:, np.newaxis] ** 2 * self.BLF[:, np.newaxis]**2 * self.Q.T).T
+            eta_BLF_Q = (
+                -eta[:, np.newaxis]
+                / lams[:, np.newaxis] ** 2
+                * self.BLF[:, np.newaxis] ** 2
+                * self.Q.T
+            ).T
 
             dKdx = self.get_stiffness_matrix_deriv(self.rhoE, eta_Q, self.Q)
 
@@ -1487,7 +1489,7 @@ class TopologyAnalysis:
 
             for i in range(self.N):
                 t1 = self.BLF[i] * (2 - (2 * x + 1) / np.sqrt(x**2 + x))
-                dfdx += eta[i] / lams[i]**2 * dadx * xi * t1
+                dfdx += eta[i] / lams[i] ** 2 * dadx * xi * t1
 
         time1 = time.time()
         self.profile["total derivative time"] += time1 - time0
@@ -1528,7 +1530,7 @@ class TopologyAnalysis:
 
         p = (3 * a * c - b**2) / (3 * a**2)
         q = (2 * b**3 - 9 * a * b * c + 27 * a**2 * d) / (27 * a**3)
-        D = (q / 2)**2 + (p / 3)**3
+        D = (q / 2) ** 2 + (p / 3) ** 3
 
         print("D: ", D)
 
@@ -1546,23 +1548,23 @@ class TopologyAnalysis:
         lams = self.get_lams_b(self.BLF, kb, xib)
         mu = 1 / lams
         c = max(mu)
-        eta = np.exp(ks_rho * (mu-c))
-        ks_min = c + np.log(np.sum(eta)) / ks_rho    
+        eta = np.exp(ks_rho * (mu - c))
+        ks_min = c + np.log(np.sum(eta)) / ks_rho
         return ks_min
 
     def get_dlams_b(self, lamc, kb, dldx, dkbdx, xib=1e-3):
-        a = 1.0     
+        a = 1.0
         c = 3
         d = -1
 
         if kb < 0:
-            b = - 27 / 4 * kb * xib**2 - 3
+            b = -27 / 4 * kb * xib**2 - 3
         else:
             b = 27 / 4 * kb * xib**2 - 3
 
         p = (3 * a * c - b**2) / (3 * a**2)
         q = (2 * b**3 - 9 * a * b * c + 27 * a**2 * d) / (27 * a**3)
-        D = (q / 2)**2 + (p / 3)**3
+        D = (q / 2) ** 2 + (p / 3) ** 3
 
         if D > 0:
             u = np.cbrt(-q / 2 + np.sqrt(D))
@@ -1634,7 +1636,7 @@ class TopologyAnalysis:
             dbdkb = -27 / 4 * xib**2
         else:
             dbdkb = 27 / 4 * xib**2
-            
+
         t1 = dfdb * dbdkb
 
         return t0 * dldx + lamc * t1 * dkbdx
@@ -1651,7 +1653,7 @@ class TopologyAnalysis:
 
         p = (3 * a * c - b**2) / (3 * a**2)
         q = (2 * b**3 - 9 * a * b * c + 27 * a**2 * d) / (27 * a**3)
-        D = (q / 2)**2 + (p / 3)**3
+        D = (q / 2) ** 2 + (p / 3) ** 3
 
         if D > 0:
             u = np.cbrt(-q / 2 + np.sqrt(D))
@@ -1723,7 +1725,7 @@ class TopologyAnalysis:
             dbdkb = -27 / 4 * xib**2
         else:
             dbdkb = 27 / 4 * xib**2
-            
+
         t1 = dfdb * dbdkb
 
         time0 = time.time()
@@ -1731,17 +1733,23 @@ class TopologyAnalysis:
         lams = self.BLF * t0
         mu = 1 / lams
         c = max(mu)
-        eta = np.exp(ks_rho * (mu-c))
+        eta = np.exp(ks_rho * (mu - c))
         eta = eta / np.sum(eta)
 
         dfdx = np.zeros(self.x.size)
 
         eta_Q = (
-            -eta[:, np.newaxis]/lams[:, np.newaxis] ** 2
+            -eta[:, np.newaxis]
+            / lams[:, np.newaxis] ** 2
             * self.BLF[:, np.newaxis]
             * self.Q.T
         ).T
-        eta_BLF_Q = (-eta[:, np.newaxis] /lams[:, np.newaxis] ** 2 * self.BLF[:, np.newaxis]**2 * self.Q.T).T
+        eta_BLF_Q = (
+            -eta[:, np.newaxis]
+            / lams[:, np.newaxis] ** 2
+            * self.BLF[:, np.newaxis] ** 2
+            * self.Q.T
+        ).T
 
         dKdx = self.get_stiffness_matrix_deriv(self.rhoE, eta_Q, self.Q)
 
@@ -1761,10 +1769,63 @@ class TopologyAnalysis:
         dfdx += (dGdx + dKdx) * t0
 
         for i in range(self.N):
-            dfdx -= eta[i] / lams[i]**2 * self.BLF[i] * t1 * dkbdx
+            dfdx -= eta[i] / lams[i] ** 2 * self.BLF[i] * t1 * dkbdx
 
         time1 = time.time()
         self.profile["total derivative time"] += time1 - time0
+
+        return dfdx
+
+    def get_ks_lamc_b(self, kb, ks_rho=160.0):
+        lams = self.BLF * kb
+        mu = 1 / lams
+        c = max(mu)
+        eta = np.exp(ks_rho * (mu - c))
+        ks_min = c + np.log(np.sum(eta)) / ks_rho
+        return ks_min
+
+    def get_ks_lamc_b_derivatives(self, kb, dkbdx, ks_rho=160.0):
+
+        lams = self.BLF * kb
+        mu = 1 / lams
+        c = max(mu)
+        eta = np.exp(ks_rho * (mu - c))
+        eta = eta / np.sum(eta)
+
+        dfdx = np.zeros(self.x.size)
+
+        eta_Q = (
+            -eta[:, np.newaxis]
+            / lams[:, np.newaxis] ** 2
+            * self.BLF[:, np.newaxis]
+            * self.Q.T
+        ).T
+        eta_BLF_Q = (
+            -eta[:, np.newaxis]
+            / lams[:, np.newaxis] ** 2
+            * self.BLF[:, np.newaxis] ** 2
+            * self.Q.T
+        ).T
+
+        dKdx = self.get_stiffness_matrix_deriv(self.rhoE, eta_Q, self.Q)
+
+        dfds = self.intital_stress_stiffness_matrix_deriv(
+            self.rhoE, self.Te, self.detJ, eta_BLF_Q, self.Q
+        )
+        dGdu = self.get_stress_stiffness_matrix_uderiv_tensor(dfds, self.Be)
+        dGdur = self.reduce_vector(dGdu)
+        adjr = -self.Kfact(dGdur)
+        adj = self.full_vector(adjr)
+
+        dGdx = self.get_stress_stiffness_matrix_xderiv_tensor(
+            self.rhoE, self.u, dfds, self.Be
+        )
+        dGdx += self.get_stiffness_matrix_deriv(self.rhoE, adj, self.u)
+
+        dfdx += (dGdx + dKdx) * kb
+
+        for i in range(self.N):
+            dfdx -= eta[i] / lams[i] ** 2 * dkbdx * self.BLF[i]
 
         return dfdx
 
@@ -5233,7 +5294,7 @@ def domain_rooda_frame(nx=120, l=8.0, lfrac=0.1):
 
     P_pst = (nt + 1) // 2
     P_nnodes = 1
-    
+
     for ip in range(P_pst, P_pst + P_nnodes):
         forces[ij_to_node(ip, nx)] = [0, P / P_nnodes]
 
@@ -5249,9 +5310,7 @@ def domain_rooda_frame(nx=120, l=8.0, lfrac=0.1):
     return conn, X, dvmap, num_design_vars, non_design_nodes, bcs, forces
 
 
-def make_model(
-    nx=64, ny=128, Ly=2.0, rfact=4.0, N=10, shear_force=False, **kwargs
-):
+def make_model(nx=64, ny=128, Ly=2.0, rfact=4.0, N=10, shear_force=False, **kwargs):
     """
 
     Parameters

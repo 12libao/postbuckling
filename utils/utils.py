@@ -430,6 +430,17 @@ class Logger:
         ):
             self.foi["c/c0"] = self.paropt.c_norm
             self.foi["ks/ks0"] = self.paropt.ks_norm
+            
+        if (
+            self.args.objf
+            in {
+                "koiter-ks-lams-b",
+                "koiter-ks-lamc-b",
+                "koiter-ks-lams-bc",
+                "compliance-buckling",
+            }
+            or "koiter-b" in self.args.confs
+        ):
             self.foi["BLF0"] = self.prob.topo.BLF[0]
 
         teig = self.profile["eigenvalue solve time"]
@@ -465,7 +476,12 @@ class Logger:
 
             if (
                 self.args.objf
-                in {"koiter-ks-lams-b", "koiter-ks-lams-bc", "compliance-buckling"}
+                in {
+                    "koiter-ks-lams-b",
+                    "koiter-ks-lamc-b",
+                    "koiter-ks-lams-bc",
+                    "compliance-buckling",
+                }
                 or "koiter-b" in self.args.confs
             ):
                 lam_s = self.prob.topo.get_lams_b(
@@ -704,8 +720,8 @@ class Logger:
         #     self.args.prefix = self.args.prefix + ", sc=" + str(self.args.sigma_scale)
 
         # use secific format for xi
-        if "xi" in self.args and self.args.objf != "ks-buckling":
-            self.args.prefix = self.args.prefix + ", xi=" + f"{self.args.xi:.0e}"
+        if "xi" in self.args and self.args.objf not in {"ks-buckling", "compliance-buckling"}:
+            self.args.prefix += f", xi={self.args.xi:.0e}"
 
         # # if args have kappa, add it to the prefix
         # if "kappa" in self.args:
