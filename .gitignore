@@ -27,6 +27,7 @@ share/python-wheels/
 *.egg
 MANIFEST
 output/
+final_output/
 out/
 *.mp4
 *.png
@@ -39,6 +40,7 @@ out/
 *.tex
 *.tikz
 *.aux
+sink_specs/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template

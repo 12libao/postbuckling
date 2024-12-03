@@ -156,6 +156,17 @@ def dfx_dkb(a, b, c, d, xib, kb):
     return dfx_db(a, b, c, d) * dbdkb
 
 
+# a = 5.896e-06
+a = 2.481e-05
+lam = 14.152
+xi = 1e-1
+
+aa = np.abs(a * xi)
+lam_s = lam * (1 + 2 * aa - 2 * np.sqrt(aa + aa**2))
+ic(lam_s)
+
+exit()
+
 xib = 1e-3
 kb = 1.661e-03
 
@@ -163,7 +174,7 @@ if kb < 0:
   cof = [1, -27 / 4 * kb * xib**2 - 3, 3, -1]
 else:
   cof = [1, 27 / 4 * kb * xib**2 - 3, 3, -1]
-  
+
 r = np.roots(cof)
 print(r)
 

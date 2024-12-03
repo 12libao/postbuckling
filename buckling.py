@@ -19,6 +19,7 @@ from eigenvector_derivatives import (
 from icecream import ic
 from joblib import Parallel, delayed
 from matplotlib.animation import FuncAnimation
+import matplotlib.gridspec as gridspec
 import matplotlib.pylab as plt
 import matplotlib.pyplot as plt
 import matplotlib.tri as tri
@@ -86,6 +87,43 @@ def _print_progress(i, n, t0, prefix="", suffix="", bar_length=20):
         print(
             f"\r{G}{prefix}{E} --> |{bar}| {percent:.1f}%, Total time: {G}{elapsed_time:.2f} s{E}"
         )
+
+
+import warnings
+
+warnings.filterwarnings("ignore", category=UserWarning)
+
+try:
+    import matplotlib
+    import niceplots
+
+    plt.style.use(niceplots.get_style())
+    matplotlib.rcParams.update(
+        {
+            "font.sans-serif": "Arial",
+            "font.family": "sans-serif",
+        }
+    )
+except:
+    pass
+
+cw = plt.colormaps["coolwarm"]
+
+
+def _set_matplotlib_rc():
+    matplotlib.rcParams.update(
+        {
+            "font.size": 12,
+            "legend.fontsize": 12,
+            "axes.labelsize": 12,
+            "axes.titlesize": 14,
+        }
+    )
+    matplotlib.rcParams.update({"axes.labelpad": 5})
+    matplotlib.rcParams["lines.linewidth"] = 1.0
+    matplotlib.rcParams["lines.markersize"] = 5.0
+
+    return
 
 
 # Timer decorator
@@ -658,12 +696,19 @@ class TopologyAnalysis:
 
     def getResidual(self, rhoE, u, lam):
         # Compute the element stiffnesses
+        # if self.ptype_K == "simp":
+        #     CK = np.outer(rhoE**self.p + self.rho0_K, self.C0)
+        #     CG = np.outer(rhoE**self.p + self.rho0_G, self.C0)
+        # else:  # ramp
+        #     CK = np.outer(rhoE / (1.0 + self.q * (1.0 - rhoE)) + self.rho0_K, self.C0)
+        #     CG = np.outer(rhoE / (1.0 + self.q * (1.0 - rhoE)) + self.rho0_G, self.C0)
+
         if self.ptype_K == "simp":
-            CK = np.outer(rhoE**self.p + self.rho0_K, self.C0)
-            CG = np.outer(rhoE**self.p + self.rho0_G, self.C0)
+            CK = np.outer(rhoE**self.p, self.C0)
+            CG = np.outer(rhoE**self.p, self.C0)
         else:  # ramp
-            CK = np.outer(rhoE / (1.0 + self.q * (1.0 - rhoE)) + self.rho0_K, self.C0)
-            CG = np.outer(rhoE / (1.0 + self.q * (1.0 - rhoE)) + self.rho0_G, self.C0)
+            CK = np.outer(rhoE / (1.0 + self.q * (1.0 - rhoE)), self.C0)
+            CG = np.outer(rhoE / (1.0 + self.q * (1.0 - rhoE)), self.C0)
 
         CK = CK.reshape((self.nelems, 3, 3))
         CG = CG.reshape((self.nelems, 3, 3))
@@ -682,19 +727,33 @@ class TopologyAnalysis:
             Te = self.Te[:, :, :, :, i]
 
             strain_nl = np.zeros((self.nelems, 3))
+            strain = np.zeros((self.nelems, 3))
             Be1 = np.zeros((self.nelems, 3, 8))
-            populate_nonlinear_strain_and_Be(Be, ue, Be1, strain_nl)
+            populate_nonlinear_strain_and_Be(Be, ue, Be1, strain_nl, strain)
 
             Be_nl = Be + Be1
             CkBe_nl = CK @ Be_nl
 
-            Re_nl = np.einsum("n, nij,ni -> nj", detJ, CkBe_nl, strain_nl)
+            Re_nl = np.einsum("n,nij,ni -> nj", detJ, CkBe_nl, strain_nl)
+            Re_nl += np.einsum(
+                "n,nij,ik,nk -> nj", detJ, Be, self.rho0_K * self.C0, strain
+            )
             np.add.at(R_nl, 2 * self.conn, Re_nl[:, ::2])
             np.add.at(R_nl, 2 * self.conn + 1, Re_nl[:, 1::2])
 
+            # Nonlinear contributions to the residual
             Ke_nl += detJ.reshape(-1, 1, 1) * Be_nl.transpose(0, 2, 1) @ CkBe_nl
 
-            s = np.einsum("nij,nj -> ni", CK, strain_nl)
+            # Linear contribution to the residual
+            Ke_nl += (
+                self.rho0_K
+                * detJ.reshape(-1, 1, 1)
+                * Be.transpose(0, 2, 1)
+                @ self.C0
+                @ Be
+            )
+
+            s = np.einsum("nij,nj -> ni", CG, strain_nl)
             G0e_nl = np.einsum("n,ni,nijl -> njl", detJ, s, Te)
 
             Ge_nl[:, 0::2, 0::2] += G0e_nl
@@ -856,7 +915,7 @@ class TopologyAnalysis:
 
         return u0, u1, u2, u3
 
-    def testR(self, u=None, lam=1.0, p=None, dh=1e-4):
+    def testR(self, u=None, lam=1.0, p=None, dh=1e-5):
         # check the residual use finite difference
         if u is None:
             u = np.random.rand(2 * self.nnodes)
@@ -866,31 +925,21 @@ class TopologyAnalysis:
         self.setBCs(u)
         self.setBCs(p)
 
-        R_li, R_nl = self.getResidual(self.rhoE, u, lam)
-        ans_li = np.dot(R_li, p)
-        ans_nl = np.dot(R_nl, p)
+        _, R = self.getResidual(self.rhoE, u, lam)
+        E1 = self.getEnergy(self.rhoE, u + dh * p, lam)[1]
+        E2 = self.getEnergy(self.rhoE, u - dh * p, lam)[1]
 
-        cd_li = (
-            self.getEnergy(self.rhoE, u + dh * p, lam)[0]
-            - self.getEnergy(self.rhoE, u - dh * p, lam)[0]
-        ) / (2 * dh)
-        cd_nl = (
-            self.getEnergy(self.rhoE, u + dh * p, lam)[1]
-            - self.getEnergy(self.rhoE, u - dh * p, lam)[1]
-        ) / (2 * dh)
+        ans = np.dot(R, p)
+        cd = (E1 - E2) / (2 * dh)
 
         print(
-            "Residual linear:    ans: %10.5e,  cd: %10.5e,  rel.err: %10.5e"
-            % (ans_li, cd_li, (ans_li - cd_li) / cd_li)
-        )
-        print(
-            "Residual nonlinear: ans: %10.5e,  cd: %10.5e,  rel.err: %10.5e"
-            % (ans_nl, cd_nl, (ans_nl - cd_nl) / cd_nl),
+            "Residual: ans: %10.5e,  cd: %10.5e,  rel.err: %10.5e"
+            % (ans, cd, np.abs(ans - cd) / cd),
             "\n",
         )
         return
 
-    def testKt(self, u=None, lam=1.0, p=None, q=None, dh=1e-4):
+    def testKt(self, u=None, lam=1.0, p=None, q=None, dh=1e-5):
         # check the tangent stiffness use finite difference
         if u is None:
             u = np.random.rand(2 * self.nnodes)
@@ -903,23 +952,16 @@ class TopologyAnalysis:
         self.setBCs(p)
         self.setBCs(q)
 
-        Kt_li, Kt_nl = self.getKt(self.rhoE, u)
-        R_li_1, R_nl_1 = self.getResidual(self.rhoE, u + dh * p, lam)
-        R_li_2, R_nl_2 = self.getResidual(self.rhoE, u - dh * p, lam)
+        # Kt_li, Kt_nl = self.getKt(self.rhoE, u)
+        Kt, _ = self.getResidual(self.rhoE, u, lam)
+        _, R1 = self.getResidual(self.rhoE, u + dh * p, lam)
+        _, R2 = self.getResidual(self.rhoE, u - dh * p, lam)
 
-        ans_li = np.dot(Kt_li @ p, q)
-        ans_nl = np.dot(Kt_nl @ p, q)
-
-        cd_li = np.dot(R_li_1 - R_li_2, q) / (2 * dh)
-        cd_nl = np.dot(R_nl_1 - R_nl_2, q) / (2 * dh)
-
+        ans = np.dot(Kt @ p, q)
+        cd = (np.dot(R1 - R2, q)) / (2 * dh)
         print(
-            "Kt linear:    ans: %10.5e,  cd: %10.5e,  rel.err: %10.5e"
-            % (ans_li, cd_li, (ans_li - cd_li) / cd_li)
-        )
-        print(
-            "Kt nonlinear: ans: %10.5e,  cd: %10.5e,  rel.err: %10.5e"
-            % (ans_nl, cd_nl, (ans_nl - cd_nl) / cd_nl),
+            "Kt: ans: %10.5e,  cd: %10.5e,  rel.err: %10.5e"
+            % (ans, cd, np.abs(ans - cd) / cd),
             "\n",
         )
         return
@@ -956,13 +998,22 @@ class TopologyAnalysis:
         scale=1.0,
         u=None,
         tol=1e-12,
-        maxiter=100,
+        maxiter=40,
         k_max=10,
         lmax=None,
         geteigval=False,
         u_imp=None,
         path=None,
     ):
+        # self.rho = np.where(self.rho < 0.8, 0, 1)
+        # self.rhoE = np.mean(self.rho[self.conn[:, :4]], axis=1)
+        # # get the index that density is zero
+        # self.rho0_K = np.where(self.rhoE < 1e-2, 1e-15, 1e-6)
+        # self.rho0_G = np.where(self.rhoE < 1e-2, 1e-15, 1e-6)
+
+        # self.rhoE = np.mean(self.rho[self.conn[:, :4]], axis=1)
+        # self.rhoE = np.where(self.rhoE < 0.5, 1e-10, 1)
+
         if u is None:
             u = np.zeros(2 * self.nnodes)
 
@@ -1004,21 +1055,45 @@ class TopologyAnalysis:
                 u = (1 + a0) * u_prev - a0 * u_prev_prev
                 l = (1 + a0) * l_prev - a0 * l_prev_prev
 
+            # apply the boundary conditions
+            self.setBCs(u)
+
             Du = u - u_prev
             Dl = l - l_prev
+
+            # # compute the residual and tangent stiffness
+            # if n > 0:
+            #     Kt, R = self.getResidual(self.rhoE, u_prev, l_prev)
+            #     Ktr = self.reduce_matrix(Kt)
+            #     Ktr_fact = sparse.linalg.factorized(Ktr)
+
+            #     u_lam = Ktr_fact(fr).reshape(-1)
+            #     u_lam = self.full_vector(u_lam)
+
+            #     dlam_ds = 1 / np.sqrt(ff + np.dot(u_lam, u_lam))
+
+            #     sign = u_lam.dot(u_prev - u_prev_prev) + (l_prev - l_prev_prev)
+            #     if sign < 0.0:
+            #         dlam_ds *= -1.0
+
+            #     u = u_prev + Ds * dlam_ds * u_lam
+            #     l = l_prev + Ds * dlam_ds
+
+            # Du = u - u_prev
+            # Dl = l - l_prev
 
             converged_prev = converged
             converged = False
 
             if path is None:
                 print(
-                    f"\nArch-Length[{n:3d}]  lam: {l:5.2f}, D_lam: {Ds:5.2e}, D_max: {Ds_max:5.2e}, time: {t:5.4f} sec"
+                    f"\nArch-Length[{n:3d}]  lam: {l:5.2f}, D_lam: {Dl:5.2e}, time: {t:5.4f} sec"
                 )
             else:
                 # write the output to the path
                 with open(path, "a") as f:
                     f.write(
-                        f"\nArch-Length[{n:3d}]  lam: {l:5.2f}, D_lam: {Ds:5.2e}, D_max: {Ds_max:5.2e}, time: {t:5.4f} sec\n"
+                        f"\nArch-Length[{n:3d}]  lam: {l:5.2f}, D_lam: {Dl:5.2e}, time: {t:5.4f} sec\n"
                     )
 
             for k in range(k_max):
@@ -1033,6 +1108,9 @@ class TopologyAnalysis:
                     A = np.dot(Du, Du) + Dl**2 * ff - Ds**2
                     a = 2 * Du
                     b = 2 * Dl * ff
+                    # A = np.dot(u_prev - u_prev_prev, Du) + Dl * (l_prev - l_prev_prev) - Ds
+                    # a = u_prev - u_prev_prev
+                    # b = (l_prev - l_prev_prev)
 
                 res = np.sqrt(np.linalg.norm(R) ** 2 + A**2)
 
@@ -1049,14 +1127,59 @@ class TopologyAnalysis:
                 # apply the boundary conditions
                 Ktr = self.reduce_matrix(Kt)
                 Rr = self.reduce_vector(R).reshape(-1, 1)
-                ar = self.reduce_vector(a).reshape(-1, 1)
-                b = sparse.csc_matrix(b).reshape(-1, 1)
 
-                # construct the matrix and solve the linear system
-                mat = sparse.bmat([[Ktr, -fr], [ar.T, b]], format="csc")
-                dx = sparse.linalg.spsolve(mat, -np.vstack([Rr, A]))
-                du = self.full_vector(dx[:-1])
-                dl = dx[-1]
+                # factorize the tangent stiffness
+                Ktr_fact = sparse.linalg.factorized(Ktr)
+
+                # compute the temporary vectors
+                aa = Ktr_fact(Rr).reshape(-1)
+                bb = np.zeros_like(aa) if n == 0 else Ktr_fact(fr).reshape(-1)
+                aa = self.full_vector(aa)
+                bb = self.full_vector(bb)
+
+                # dl = (a.T @ aa - A) / (a.T @ bb + b)
+                # du = -aa + dl * bb
+
+                du_t = bb
+                du_bar = -aa
+
+                a1 = np.dot(du_t.T, du_t) + ff
+                a2 = 2 * np.dot((Du + du_bar).T, du_t) + 2 * Dl * ff
+                a3 = np.dot((Du + du_bar).T, (Du + du_bar)) + Dl**2 * ff - Ds**2
+
+                if n == 0:
+                    dl = (a.T @ aa - A) / (a.T @ bb + b)
+                    du = -aa + dl * bb
+                else:
+                    # solve the quadratic equation
+                    dl1 = (-a2 + np.sqrt(a2**2 - 4 * a1 * a3)) / (2 * a1)
+                    dl2 = (-a2 - np.sqrt(a2**2 - 4 * a1 * a3)) / (2 * a1)
+
+                    du1 = du_bar + dl1 * du_t
+                    du2 = du_bar + dl2 * du_t
+
+                    t = np.dot(Du.T, du_t) + Dl
+
+                    # if t * dl1 > t * dl2:
+                    #     dl = dl1
+                    # else:
+                    #     dl = dl2
+
+                    # du = du_bar + dl * du_t
+
+                    # choose the solution
+                    dot1 = (Du + du1).T @ Du + Dl * (Dl + dl1) * ff
+                    dot2 = (Du + du2).T @ Du + Dl * (Dl + dl2) * ff
+
+                    if dot1 > dot2:
+                        dl = dl1
+                        du = du1
+                    else:
+                        dl = dl2
+                        du = du2
+
+                # apply the boundary conditions
+                self.setBCs(du)
 
                 # update the solution
                 u += du
@@ -2589,19 +2712,13 @@ class TopologyAnalysis:
         # Lr = (self.Kr @ Q0r).reshape(-1, 1)
         # mat = sparse.bmat([[Ar, -Lr], [-Lr.T, [0]]], format="csc")
 
-        # dK1dQ0_cd = self.get_dK1dQ0_cd(rhoE, Q0, Q0, Q0)
-        # dK1dQ0_cd = self.reduce_vector(dK1dQ0_cd)
-
-        # dK1dQ0_cs = self.get_dK1dQ0_cs(rhoE, K1, Q0, Q0, Q0)
-        # dK1dQ0_cs = self.reduce_vector(dK1dQ0_cs)
-
         Qb = Q0r @ (K1r.T + 2 * K1r)
         rhs = np.hstack([Qb, 0])
-        psi = self.matfactor(-1.5 * rhs)
+        psi = self.matfactor(-1.5 * Q0_norm * rhs)
         # psi = sparse.linalg.spsolve(mat, -1.5 * rhs)
 
         psi0 = self.full_vector(psi[:-1])
-        psi1 = -psi[-1] / Q0_norm
+        psi1 = -psi[-1]
 
         dGdx1 = self.get_stress_stiffness_matrix_xuderiv(rhoE, self.u, psi0, Q0)
         dKdx1 = self.get_stiffness_matrix_deriv(rhoE, psi0, Q0)
@@ -3558,9 +3675,9 @@ class TopologyAnalysis:
         self.Te = np.zeros((self.nelems, 3, 4, 4, 4))
         self.detJ = np.zeros((self.nelems, 4))
 
-        self.detJ_kokkos = np.zeros((2, 2, self.nelems))
-        self.Be_kokkos = np.zeros((2, 2, self.nelems, 3, 8))
-        self.Te_kokkos = np.zeros((2, 2, self.nelems, 3, 4, 4))
+        # self.detJ_kokkos = np.zeros((2, 2, self.nelems))
+        # self.Be_kokkos = np.zeros((2, 2, self.nelems, 3, 8))
+        # self.Te_kokkos = np.zeros((2, 2, self.nelems, 3, 4, 4))
 
         for j in range(2):
             for i in range(2):
@@ -3573,9 +3690,9 @@ class TopologyAnalysis:
                     self.nelems, xi, eta, xe, ye, Bei, Tei
                 )
 
-                self.detJ_kokkos[i, j, :] = self.detJ[:, index]
-                self.Be_kokkos[i, j, :, :, :] = Bei
-                self.Te_kokkos[i, j, :, :, :, :] = Tei
+                # self.detJ_kokkos[i, j, :] = self.detJ[:, index]
+                # self.Be_kokkos[i, j, :, :, :] = Bei
+                # self.Te_kokkos[i, j, :, :, :, :] = Tei
 
         return
 
@@ -4799,7 +4916,8 @@ class TopologyAnalysis:
 
     def plot_design(self, path=None, index=None):
         fig, ax = plt.subplots()
-        self.plot(self.rho, ax=ax)
+        # self.rho[: self.nnodes] = 0.0
+        self.plot(self.rho, ax=ax, scale=0.2, cmap="gray_r", extend="max")
 
         # # plot the nodes
         # for i in range(self.nnodes):
@@ -4814,35 +4932,35 @@ class TopologyAnalysis:
         #         y1 = self.X[self.conn[i, (j + 1) % 4], 1]
         #         ax.plot([x0, x1], [y0, y1], color="k", linewidth=0.5, clip_on=False)
 
-        # # plot the bcs
-        # for i, v in self.bcs.items():
-        #     ax.scatter(self.X[i, 0], self.X[i, 1], color="b", s=5, clip_on=False)
+        # plot the bcs
+        for i, v in self.bcs.items():
+            ax.scatter(self.X[i, 0], self.X[i, 1], color="b", s=5, clip_on=False)
 
-        # plot the non-design nodes
+        # # plot the non-design nodes
         # m0_X = np.array([self.X[i, :] for i in self.fltr.non_design_nodes])
         # ax.scatter(m0_X[:, 0], m0_X[:, 1], color="blue", s=5, clip_on=False)
 
-        # for i, v in self.forces.items():
-        #     ax.quiver(
-        #         self.X[i, 0],
-        #         self.X[i, 1],
-        #         v[0],
-        #         v[1],
-        #         color="r",
-        #         scale=1e-3,
-        #         clip_on=False,
-        #     )
+        for i, v in self.forces.items():
+            ax.quiver(
+                self.X[i, 0],
+                self.X[i, 1] - v[1] * 0.5 * 1e3,
+                v[0],
+                v[1],
+                color="r",
+                scale=2 * 1e-3,
+                clip_on=False,
+            )
 
-        # if index is not None:
-        #     for i in index:
-        #         ax.scatter(
-        #             self.X[i, 0], self.X[i, 1], color="orange", s=5, clip_on=False
-        #         )
+        if index is not None:
+            for i in index:
+                ax.scatter(
+                    self.X[i, 0], self.X[i, 1], color="orange", s=5, clip_on=False
+                )
 
-        ## add midline vertical line
+        # # add midline vertical line
         # ax.plot([0.5, 0.5], [0, 2], color="k", linestyle="--")
 
-        ## add midline horizontal line
+        # # add midline horizontal line
         # ax.plot([0, 1], [1, 1], color="k", linestyle="--")
 
         ax.set_aspect("equal")
@@ -4956,39 +5074,94 @@ class TopologyAnalysis:
         indx_neg = np.where(eigvals < 0)[0]
         indx_pos = np.where(eigvals > 0)[0]
 
-        fig, ax = plt.subplots(1, 2, figsize=(12, 4), tight_layout=True)
-        ax[0].plot(u[:, indx], l / self.lam[0], marker="o")
-        ax[0].set_xlabel(r"$u_x$")
+        # fig, ax = plt.subplots(1, 2, figsize=(12, 4), tight_layout=True)
+        fig = plt.figure(figsize=(15, 4))
+        gs = gridspec.GridSpec(1, 2, width_ratios=[1, 1], wspace=0.3)
+        _set_matplotlib_rc()
+
+        ax0 = plt.subplot(gs[0, 0])
+        ax1 = plt.subplot(gs[0, 1])
+
+        fig.add_subplot(ax0)
+        fig.add_subplot(ax1)
+
+        ax = [ax0, ax1]
+
+        ax[0].plot(
+            u[:, indx],
+            l / self.lam[0],
+            marker="o",
+            c="k",
+            markeredgecolor="k",
+            clip_on=False,
+        )
+        ax[0].set_xlabel(r"$dx$")
         ax[0].set_ylabel(r"$\lambda/\lambda_c$")
-        ax[0].axvline(x=0, color="grey", linestyle="--")
-        ax[0].axhline(y=1, color="grey", linestyle="--")
+        ax[0].invert_xaxis()
 
-        # add twin y axis to plot eigvals
-        ax2 = ax[0].twinx()
-        ax2.semilogy(u[:, indx], np.abs(eigvals), color="k")
-        ax2.scatter(u[indx_neg, indx], np.abs(eigvals[indx_neg]), color="b", zorder=10)
-        ax2.scatter(u[indx_pos, indx], eigvals[indx_pos], color="r", zorder=10)
-        ax2.set_ylabel(r"$|\lambda_0(K_T)|$", color="r")
+        # # add twin y axis to plot eigvals
+        # ax2 = ax[0].twinx()
+        # ax2.semilogy(u[:, indx], np.abs(eigvals), color="k",clip_on=False)
+        # ax2.plot(u[indx_neg, indx], np.abs(eigvals[indx_neg]), color=cw(0.0), zorder=10,clip_on=False,marker="o", markeredgecolor=cw(0.0), ms=2.5)
+        # ax2.plot(
+        #     u[indx_pos, indx],
+        #     eigvals[indx_pos],
+        #     color=cw(1.0),
+        #     zorder=10,
+        #     clip_on=False,
+        #     marker="o",
+        #     markeredgecolor=cw(1.0),ms=2.5
+        # )
+        # ax2.scatter(u[indx_pos[-1], indx], eigvals[indx_pos[-1]], color="k", zorder=10,clip_on=False)
+        # ax2.set_ylabel(r"$|\lambda_0(K_T)|$", color=cw(1.0))
+        # ax2.set_ylim(ymin=1e-8)
+        # ax2.spines["right"].set_visible(True)
 
-        ax[1].plot(u[:, indy], l / self.lam[0], marker="o")
-        ax[1].set_xlabel(r"$u_y$")
+        ax[1].plot(
+            u[:, indy],
+            l / self.lam[0],
+            marker="o",
+            color="k",
+            clip_on=False,
+            markeredgecolor="k",
+        )
+        ax[1].set_xlabel(r"$dy$")
         ax[1].set_ylabel(r"$\lambda/\lambda_c$")
-        ax[1].axvline(x=0, color="k", linestyle="--")
-        ax[1].axhline(y=1, color="k", linestyle="--")
-
-        ax2 = ax[1].twinx()
-        ax2.semilogy(u[:, indy], np.abs(eigvals), color="k")
-        ax2.scatter(u[indx_neg, indy], np.abs(eigvals[indx_neg]), color="b", zorder=10)
-        ax2.scatter(u[indx_pos, indy], eigvals[indx_pos], color="r", zorder=10)
-        ax2.set_ylabel(r"$|\lambda_0(K_T)|$", color="r")
         ax[1].invert_xaxis()
 
-        plt.savefig(path, bbox_inches="tight")
+        # ax2 = ax[1].twinx()
+        # ax2.semilogy(u[:, indy], np.abs(eigvals), color="k",clip_on=False)
+        # ax2.plot(
+        #     u[indx_neg, indy],
+        #     np.abs(eigvals[indx_neg]),
+        #     color=cw(0.0),
+        #     zorder=10,
+        #     clip_on=False,
+        #     marker="o",
+        #     markeredgecolor=cw(0.0),ms=2.5
+        # )
+        # ax2.plot(
+        #     u[indx_pos, indy],
+        #     eigvals[indx_pos],
+        #     color=cw(1.0),
+        #     zorder=10,
+        #     clip_on=False,
+        #     marker="o",
+        #     markeredgecolor=cw(1.0),
+        #     ms=2.5,
+        # )
+        # ax2.scatter(u[indx_pos[-1], indy], eigvals[indx_pos[-1]], color="k", zorder=10,clip_on=False)
+        # ax2.set_ylabel(r"$|\lambda_0(K_T)|$", color=cw(1.0))
+        # ax2.set_ylim(ymin=1e-8)
+        # ax2.spines["right"].set_visible(True)
+
+        plt.savefig(path, bbox_inches="tight", pad_inches=0.1, dpi=300)
 
         return ax
 
     def read_vtk(self, file):
         x, rho = [], []
+        ic(self.nnodes)
         with open(file) as f:
             for num, line in enumerate(f, 1):
                 if "design" in line:
@@ -5001,21 +5174,54 @@ class TopologyAnalysis:
 
     def plot_u_varify(self, domain, s, xib, file=None):
         if file is not None:
-            self.x, self.rho = self.read_vtk(f"./output/{domain}/arc/{file}/{file}.vtk")
+            self.x, self.rho = self.read_vtk(
+                f"./output/{domain}/arc/{file}/it_1000.vtk"
+            )
         else:
-            file = f"{self.nnodes}"
+            file = f"{s}_{xib}"
             os.makedirs(f"./output/{domain}/arc/{file}", exist_ok=True)
 
-        # if f"{xib}_{s}.log" is exist,clean it
-        if os.path.exists(f"./output/{domain}/arc/{file}/{xib}_{s}.log"):
-            os.remove(f"./output/{domain}/arc/{file}/{xib}_{s}.log")
+        # # if f"{xib}_{s}.log" is exist,clean it
+        # if os.path.exists(f"./output/{domain}/arc/{file}/{xib}_{s}.log"):
+        #     os.remove(f"./output/{domain}/arc/{file}/{xib}_{s}.log")
+
+        # # if rho is less than 0.5, set it to 0 whele all other values are 1
+        # self.rho = np.where(self.rho < 0.8, 0, 1)
+        # self.x = np.where(self.rho < 0.8, 0, 1)
+        # self.rhoE = np.mean(self.rho[self.conn[:, :4]], axis=1)
+        # self.rhoE = np.where(self.rhoE < 1e-3, 0, 1)
 
         self.initialize()
+
+        self.plot_design(f"./output/{domain}/arc/{file}/design.pdf")
+
+        u, l = self.arc_length_method(
+            Dl=self.lam[0] * 0.05,  # 0.2
+            lmax=self.lam[0] * 5,
+            scale=s,
+            u_imp=xib * self.Q[:, 0],
+            tol=1e-7,
+            # path=f"./output/{domain}/arc/{file}/{xib}_{s}.log",
+        )
+
+        np.save(f"./output/{domain}/arc/{file}/u_{xib}_{s}.npy", u)
+        np.save(f"./output/{domain}/arc/{file}/l_{xib}_{s}.npy", l)
+
+        u = np.load(f"./output/{domain}/arc/{file}/u_{xib}_{s}.npy")
+        l = np.load(f"./output/{domain}/arc/{file}/l_{xib}_{s}.npy")
+
+        self.video_u(u, l, f"./output/{domain}/arc/{file}/u_{xib}_{s}.mp4")
+
+        self.rhoE = np.mean(self.rho[self.conn[:, :4]], axis=1)
+
         self.initialize_koiter()
         a = self.a
         b = self.b
         u1 = self.u1
         u2 = self.u2
+
+        print("a = ", a)
+        print("b = ", b)
 
         with open(f"./output/{domain}/arc/{file}/{xib}_{s}.log", "w") as f:
             f.write(f"Using xib = {xib} and s = {s}\n")
@@ -5030,22 +5236,9 @@ class TopologyAnalysis:
         indy = indy[len(indy) // 2]
         indx = indy - 1
 
-        u, l = self.arc_length_method(
-            Dl=self.lam[0] * 0.2,  # 0.2
-            lmax=self.lam[0] * 5,
-            scale=s,
-            u_imp=xib * self.Q[:, 0],
-            path=f"./output/{domain}/arc/{file}/{xib}_{s}.log",
-        )
-
-        np.save(f"./output/{domain}/arc/{file}/u_{xib}_{s}.npy", u)
-        np.save(f"./output/{domain}/arc/l_{xib}_{s}.npy", l)
-
-        u = np.load(f"./output/{domain}/arc/{file}/u_{xib}_{s}.npy")
-        l = np.load(f"./output/{domain}/arc/{file}/l_{xib}_{s}.npy")
-
         # apply the Koiter-Asymptotic
-        xi = np.linspace(0, 5e1, 100)
+        xi = np.linspace(0, 5e1, 100)  # 5e1, rooda: 2e1
+        xib0 = xib
         xib = xib * np.linalg.norm(topo.Q[:, 0])
 
         # compute lambda based on xi value
@@ -5063,11 +5256,6 @@ class TopologyAnalysis:
             u_imp = np.vstack((np.zeros(topo.nvars), u_imp))
             lam_imp = np.hstack((0, lam_imp))
 
-        if self.a < 1e-12:
-            lam_s = self.get_lams_b(self.lam[0], self.b, xib)
-        else:
-            lam_s = self.get_lam_s(self.lam[0], self.a, xib)
-
         # plot the displacement
         fig, ax = plt.subplots(1, 2, figsize=(12, 4), tight_layout=True)
         ax[0].plot(
@@ -5075,30 +5263,31 @@ class TopologyAnalysis:
             l / self.lam[0],
             marker="o",
             label="Arc-Length",
+            color="b",
+            markeredgecolor="b",
+            clip_on=False,
+            linewidth=1.5,
         )
         ax[1].plot(
             u[:, indy],
             l / self.lam[0],
             marker="o",
             label="Arc-Length",
+            color="b",
+            markeredgecolor="b",
+            clip_on=False,
+            linewidth=1.5,
         )
         l0 = ax[0].plot(
             u_imp[:, indx],
             lam_imp / self.lam[0],
-            marker="o",
-            ms=2,
             label="Koiter",
         )
         l2 = ax[1].plot(
             u_imp[:, indy],
             lam_imp / self.lam[0],
-            marker="o",
-            ms=2,
             label="Koiter",
         )
-
-        ax[0].axhline(y=lam_s / self.lam[0], color=l0[0].get_color(), linestyle="--")
-        ax[1].axhline(y=lam_s / self.lam[0], color=l2[0].get_color(), linestyle="--")
 
         ax[0].set_xlabel(r"$u_x$")
         ax[0].set_ylabel(r"$\lambda/\lambda_c$")
@@ -5109,12 +5298,12 @@ class TopologyAnalysis:
         ax[1].invert_xaxis()
         ax[1].legend()
 
-        plt.savefig(f"./output/{domain}/arc/{file}/{xib}_{s}.png", bbox_inches="tight")
+        plt.savefig(f"./output/{domain}/arc/{file}/{xib0}_{s}.pdf", bbox_inches="tight")
         plt.close()
 
         return
 
-    def plot_u_compare(self, read=False, path=None, lam_s=None):
+    def plot_u_compare(self, read=False, lam_s=None):
         if read:
             self.x, self.rho = self.read_vtk("./output/it_600.vtk")
 
@@ -5133,141 +5322,252 @@ class TopologyAnalysis:
         indy = indy[len(indy) // 2]
         indx = indy - 1
 
-        xib0 = [0, 0.0001, 0.001, 0.01]
+        xib0 = [0, 0.0001, 0.001, 0.005]
 
-        cb = [cw(0.0), cw(0.1), cw(0.2), cw(0.3)]
-        cr = [cw(1.0), cw(0.9), cw(0.8), cw(0.7)]
+        cb = [cw(0.0), cw(0.1), cw(0.1), cw(0.2)]
+        cr = [cw(1.0), cw(0.9), cw(0.9), cw(0.8)]
 
         # scale = [0.4, 0.4, 0.95, 6]
-        scale = [1.8, 1.8, 1.8, 2.2]
+        # scale = [1.5, 1.5, 1.5, 2.6]
+        scale = [1.5, 1.5, 1.5, 1.8]
         u_arc = []
         l_arc = []
 
-        # make directory if not exist
-        os.makedirs("./output/arc", exist_ok=True)
+        # for i in range(len(xib0)):
+        #     u, l = self.arc_length_method(
+        #         Dl=self.lam[0] * 0.2,  # 0.2
+        #         lmax=self.lam[0] * 5,
+        #         scale=scale[i],
+        #         u_imp=xib0[i] * self.Q[:, 0],
+        #     )
+        #     u_arc.append(u)
+        #     l_arc.append(l)
 
-        for i in range(len(xib0)):
-            u, l = self.arc_length_method(
-                Dl=self.lam[0] * 0.2,  # 0.2
-                lmax=self.lam[0] * 5,
-                scale=scale[i],
-                u_imp=xib0[i] * self.Q[:, 0],
-            )
-            u_arc.append(u)
-            l_arc.append(l)
+        # np.save("./output/u_arc.npy", u_arc)
+        # np.save("./output/l_arc.npy", l_arc)
 
-            np.save("./output/arc/u_arc_%d_%d.npy" % (scale[i], xib0[i]), u)
-            np.save("./output/arc/l_arc_%d_%d.npy" % (scale[i], xib0[i]), l)
-
-        for i in range(len(xib0)):
-            u = np.load("./output/arc/u_arc_%d_%d.npy" % (scale[i], xib0[i]))
-            l = np.load("./output/arc/l_arc_%d_%d.npy" % (scale[i], xib0[i]))
-            u_arc.append(u)
-            l_arc.append(l)
+        u_arc = np.load("./output/u_arc.npy")
+        l_arc = np.load("./output/l_arc.npy")
 
         # plot the force-displacement curve
-        fig, ax = plt.subplots(1, 2, figsize=(12, 4), tight_layout=True)
+        fig = plt.figure(figsize=(15, 8))
+        gs = gridspec.GridSpec(2, 2, width_ratios=[1, 1], wspace=0.1, hspace=0.4)
+        _set_matplotlib_rc()
+
+        ax0 = plt.subplot(gs[0, 0])
+        ax1 = plt.subplot(gs[0, 1])
+        ax2 = plt.subplot(gs[1, 0])
+        ax3 = plt.subplot(gs[1, 1])
+
+        fig.add_subplot(ax0)
+        fig.add_subplot(ax1)
+
+        imp = [
+            r"$\bar{\xi}=0$",
+            r"$\bar{\xi}=0.01 \% \|\phi_1\|$",
+            r"$\bar{\xi}=0.1 \%  \|\phi_1\|$",
+            r"$\bar{\xi}=0.5 \%  \|\phi_1\|$",
+        ]
 
         for i in range(len(xib0)):
-            if xib0[i] == 0:
-                label = r"Arc-Length $\bar{\xi}$ = 0"
-            else:
-                label = r"Arc-Length $\bar{\xi}$ = %.e$\phi_1$" % np.abs(xib0[i])
+            if i != 1:
+                ax3.plot(
+                    u_arc[i][:, indy],
+                    l_arc[i] / self.lam[0],
+                    marker="o",
+                    label=r"Arc-Length " + imp[i],
+                    color=cb[i],
+                    markeredgecolor=cb[i],
+                    clip_on=False,
+                    linewidth=1.5,
+                )
 
-            ax[0].plot(
-                u_arc[i][:, indx],
-                l_arc[i] / self.lam[0],
-                marker="o",
-                label=label,
-                color=cb[i],
-            )
-            ax[1].plot(
-                u_arc[i][:, indy],
-                l_arc[i] / self.lam[0],
-                marker="o",
-                label=label,
-                color=cb[i],
-            )
+        for i in range(4):
+            ax = [ax0, None, ax1, ax2][i]
+            if i != 1:
+                ax.plot(
+                    u_arc[i][:, indx],
+                    l_arc[i] / self.lam[0],
+                    marker="o",
+                    label=r"Arc-Length " + imp[i],
+                    color=cb[i],
+                    markeredgecolor=cb[i],
+                    clip_on=False,
+                    linewidth=1.5,
+                )
 
         # apply the Koiter-Asymptotic
-        xi = np.linspace(0, 5e1, 100)
+        xi = np.linspace(0, 2.3e1, 1000)
 
         # generate the Koiter-Asymptotic for different imperfection
         u = []
         lam = []
+
         for i in range(len(xib0)):
-            xib = xib0[i] * np.linalg.norm(topo.Q[:, 0])
+            ax = [ax0, None, ax1, ax2][i]
 
-            # compute lambda based on xi value
-            if xib == 0:
-                lam_imp = (1 + a * xi + b * xi**2) * self.lam[0]
-            else:
-                lam_imp = (xi + a * xi**2 + b * xi**3) / (xi + xib) * self.lam[0]
+            if i != 1:
 
-            # compute the displacement based on lambda and xi
-            u_imp = np.zeros((lam_imp.size, topo.nvars))
-            for n in range(lam_imp.size):
-                u_imp[n, :] = lam_imp[n] * self.u + xi[n] * u1 + xi[n] ** 2 * u2
+                xib = xib0[i] * np.linalg.norm(topo.Q[:, 0])
 
-            if xib == 0:
-                u_imp = np.vstack((np.zeros(topo.nvars), u_imp))
-                lam_imp = np.hstack((0, lam_imp))
+                # compute lambda based on xi value
+                if xib == 0:
+                    lam_imp = (1 + a * xi + b * xi**2) * self.lam[0]
+                else:
+                    lam_imp = (xi + a * xi**2 + b * xi**3) / (xi + xib) * self.lam[0]
 
-            if self.a < 1e-12:
-                lam_s = self.get_lams_b(self.lam[0], self.b, xib0[i])
-            else:
-                lam_s = self.get_lam_s(self.lam[0], self.a, xib0[i])
+                # compute the displacement based on lambda and xi
+                u_imp = np.zeros((lam_imp.size, topo.nvars))
+                for n in range(lam_imp.size):
+                    u_imp[n, :] = lam_imp[n] * self.u + xi[n] * u1 + xi[n] ** 2 * u2
 
-            ic(lam_s)
+                if xib == 0:
+                    u_imp = np.vstack((np.zeros(topo.nvars), u_imp))
+                    lam_imp = np.hstack((0, lam_imp))
 
-            if xib0[i] == 0:
-                la = r"Koiter-Asymptotic $\bar{\xi}$ = 0"
-            else:
-                la = r"Koiter-Asymptotic $\bar{\xi}$ = %.e$\phi_1$" % np.abs(xib0[i])
-            l0 = ax[0].plot(
-                u_imp[:, indx],
-                lam_imp / self.lam[0],
-                marker="o",
-                label=la,
-                ms=2,
-                color=cr[i],
-            )
-            l2 = ax[1].plot(
-                u_imp[:, indy],
-                lam_imp / self.lam[0],
-                marker="o",
-                label=la,
-                ms=2,
-                color=cr[i],
-            )
+                if self.a < 1e-12:
+                    lam_s = self.get_lams_b(self.lam[0], self.b, xib0[i])
+                else:
+                    lam_s = self.get_lam_s(self.lam[0], self.a, xib0[i])
 
-            ax[0].axhline(
-                y=lam_s / self.lam[0], color=l0[0].get_color(), linestyle="--"
-            )
-            ax[1].axhline(
-                y=lam_s / self.lam[0], color=l2[0].get_color(), linestyle="--"
-            )
+                ic(lam_s)
 
-            u.append(u_imp)
-            lam.append(lam_imp)
+                ax3.plot(
+                    u_imp[:, indy],
+                    lam_imp / self.lam[0],
+                    label=r"Koiter Asymptotic " + imp[i],
+                    color=cr[i],
+                    clip_on=False,
+                )
 
-        ax[0].set_xlabel(r"$u_x$")
-        ax[0].set_ylabel(r"$\lambda/\lambda_c$")
-        # ax[0].axvline(x=0, color="grey", linestyle="--")
-        # ax[0].axhline(y=1, color="grey", linestyle="--")
-        ax[0].legend()
+                ax.plot(
+                    u_imp[:, indx],
+                    lam_imp / self.lam[0],
+                    label=r"Koiter Asymptotic " + imp[i],
+                    color=cr[i],
+                    clip_on=False,
+                )
 
-        ax[1].set_xlabel(r"$u_y$")
-        ax[1].set_ylabel(r"$\lambda/\lambda_c$")
-        # ax[1].axvline(x=0, color="grey", linestyle="--")
-        # ax[1].axhline(y=1, color="grey", linestyle="--")
-        ax[1].invert_xaxis()
-        ax[1].legend()
+        title = [
+            r"$\bf{(a)}$ Load-displacement curve for $dx$ ($\bar{\xi}=0$)",
+            r"$\bf{(b)}$ Load-displacement curve for $dx$ ($\bar{\xi}=0.1 \% \|\phi_1\|$)",
+            r"$\bf{(c)}$ Load-displacement curve for $dx$ ($\bar{\xi}=0.5 \% \|\phi_1\|$)",
+            r"$\bf{(d)}$ Load-displacement curve for $dy$",
+        ]
 
-        if path is not None:
-            plt.savefig(path, bbox_inches="tight")
+        xlabel = [
+            r"Horizontal Displacement $dx$ for the Node Applied Load",
+            r"Horizontal Displacement $dx$ for the Node Applied Load",
+            r"Horizontal Displacement $dx$ for the Node Applied Load",
+            r"Vertical Displacement $dy$ for the Node Applied Load",
+        ]
+
+        # leave a space between axis and zero
+        for i in range(4):
+            ax = [ax0, ax1, ax2, ax3][i]
+            ax.margins(x=0.03)
+            ax.margins(y=0.05)
+            ax.invert_xaxis()
+            ax.set_ylim(ymax=1.1)
+            ax.set_title(title[i], fontsize=14, weight="bold", color="k", y=0.95)
+            ax.legend(ncol=2, fontsize=10.5, loc="lower right")
+            ax.set_xlabel(xlabel[i])
+
+        ax0.set_ylabel(r"$\lambda/\lambda_c$")
+        ax2.set_ylabel(r"$\lambda/\lambda_c$")
+
+        plt.savefig("./output/koiter-arc.pdf", bbox_inches="tight", pad_inches=0.02)
 
         return u, lam, xib0
+
+    def plot_derivative_check(self):
+
+        # set random seed
+        np.random.seed(1234)
+
+        # set the perturbation size
+        dh = 5e-3
+        p = np.random.rand(self.x.size)
+        p /= np.linalg.norm(p)
+        x0 = self.x
+
+        self.initialize()
+        Q0 = self.Q[:, 0]
+        Q0_norm = np.linalg.norm(Q0)
+        self.initialize_koiter(Q0_norm)
+
+        self.initialize_koiter_derivative()
+        dadx_ans = np.dot(self.dadx, p)
+        dbdx_ans = np.dot(self.dbdx, p)
+
+        # use linspace gererate dh from 1e+1 to 1e-10
+        dh0 = 1
+        dh1 = -12
+        dhn = 10 * (dh0 - dh1 + 1)
+        dh = np.logspace(dh0, dh1, num=dhn)
+
+        error_a = np.zeros(dhn)
+        error_b = np.zeros(dhn)
+
+        # for i in range(dhn):
+        #     self.x = x0 + dh[i] * p
+        #     self.initialize()
+        #     Q1 = self.Q[:, 0]
+        #     self.Q[:, 0] = np.where(np.dot(Q0, Q1) < 0, -Q1, Q1)
+        #     self.initialize_koiter(Q0_norm)
+        #     a1 = self.a
+        #     b1 = self.b
+
+        #     self.x = x0 - dh[i] * p
+        #     self.initialize()
+        #     Q2 = self.Q[:, 0]
+        #     self.Q[:, 0] = np.where(np.dot(Q0, Q2) < 0, -Q2, Q2)
+        #     self.initialize_koiter(Q0_norm)
+        #     a2 = self.a
+        #     b2 = self.b
+
+        #     dadx_fd = (a1 - a2) / (2 * dh[i])
+        #     dbdx_fd = (b1 - b2) / (2 * dh[i])
+
+        #     error_a[i] = np.abs((dadx_ans - dadx_fd) / dadx_fd)
+        #     error_b[i] = np.abs((dbdx_ans - dbdx_fd) / dbdx_fd)
+
+        # # save the error
+        # np.save("./output/error_a.npy", error_a)
+        # np.save("./output/error_b.npy", error_b)
+
+        # read the error
+        error_a = np.load("./output/error_a.npy")
+        error_b = np.load("./output/error_b.npy")
+
+        fig = plt.figure(figsize=(15, 4))
+        gs = gridspec.GridSpec(1, 2, width_ratios=[1, 1])
+        _set_matplotlib_rc()
+
+        title = [
+            r"$\bf{(a)}$ Derivative check for Koiter factor $a$ vs. Central Difference",
+            r"$\bf{(b)}$ Derivative check for Koiter factor $b$ vs. Central Difference",
+        ]
+
+        for i in range(2):
+            ax = plt.subplot(gs[i])
+            fig.add_subplot(ax)
+
+            error = [error_a, error_b][i]
+            ax.plot(dh, error, marker="o", clip_on=False, color=cw(0.0))
+            ax.set_xscale("log")
+            ax.set_yscale("log")
+            ax.set_xlabel("Step size")
+            ax.set_ylabel("Relative error")
+            ax.invert_xaxis()
+            ax.set_ylim([1e-10, 2e1])
+            ax.set_title(title[i], fontsize=14, weight="bold", color="k")
+
+        plt.savefig(
+            "./output/derivative_check.pdf", bbox_inches="tight", pad_inches=0.02
+        )
+
+        return
 
 
 def domain_compressed_column(nx=64, ny=128, Lx=1.0, Ly=2.0, shear_force=False):
@@ -5558,7 +5858,7 @@ if __name__ == "__main__":
         nx = 200
     else:
         domain = "rooda"
-        nx = 100
+        nx = 600
 
     if "s" in sys.argv:
         s = float(sys.argv[sys.argv.index("s") + 1])
@@ -5584,14 +5884,43 @@ if __name__ == "__main__":
         adjoint_method=method,
         adjoint_options=adjoint_options,
         shear_force=False,  # True,
-        deriv_type="vector",
+        deriv_type="tensor",
         domain=domain,  # "column", "rooda",
         b0=16.0,
         p=6.0,
         projection=True,
     )
 
+    # topo.initialize()
+    # topo.testKt()
+
+    # topo.plot_derivative_check()
+    # topo.plot_u_compare()
+
     topo.plot_u_varify(domain, s, xib, file)
+
+    # topo.initialize()
+    exit()
+
+    # u_list, lam_list, eig_list = topo.arc_length_method(
+    #     Dl=topo.lam[0] * 0.2,
+    #     scale=1.5,
+    #     lmax=topo.lam[0] * 5,
+    #     geteigval=True,
+    #     maxiter=100,
+    #     u_imp=0 * topo.Q[:, 0],
+    # )
+    # np.save("./output/u_list.npy", u_list)
+    # np.save("./output/lam_list.npy", lam_list)
+    # np.save("./output/eig_list.npy", eig_list)
+
+    u_list = np.load("./output/u_list.npy")
+    lam_list = np.load("./output/lam_list.npy")
+    eig_list = np.load("./output/eig_list.npy")
+
+    # plot the u as a video that shows the buckling process
+    # topo.video_u(u_list, lam_list, "arc_length.mp4", "Arc-Length")
+    topo.plot_u(u_list, lam_list, eig_list, "arc_length_0.pdf")
 
     # check the buckling load factor vs sparse.linalg.eigsh
     # topo.check_blf()
@@ -5638,34 +5967,8 @@ if __name__ == "__main__":
     # u1 = np.load("./output/u_list.npy")
     # l1 = np.load("./output/lam_list.npy")
 
-    # topo.plot_u_compare(u1, l1, ue, lam, "buckling_path.pdf")
-
     # # topo.plot_design("design.pdf")
     # lmax = topo.lam[0] * 5
-
-    # u_list, lam_list, eigvals = topo.arc_length_method(
-    #     Dl=topo.lam[0] * 0.2,
-    #     scale=16,
-    #     lmax=topo.lam[0] * 5,
-    #     geteigval=False,
-    #     maxiter=100,
-    #     u_imp=-1e-2 * topo.Q[:, 0],
-    # )
-    # np.save("./output/u_list.npy", u_list)
-    # np.save("./output/lam_list.npy", lam_list)
-    # np.save("./output/eigvals.npy", eigvals)
-
-    # u_newton = topo.newton_raphson(lam=max(lam_list))
-    # np.save("./output/u_newton.npy", u_newton)
-
-    # u_list = np.load("./output/u_list.npy")
-    # lam_list = np.load("./output/lam_list.npy")
-    # eigvals = np.load("./output/eigvals.npy")
-    # u_newton = np.load("./output/u_newton.npy")
-
-    # plot the u as a video that shows the buckling process
-    # topo.video_u(u_list, lam_list, "arc_length.mp4", "Arc-Length")
-    # topo.plot_u(u_list, lam_list, eigvals, "arc_length.pdf")
 
     # u1, _= topo.arc_length_method(Dl=topo.lam[0] * 0.1, lmax=lam_c)
 

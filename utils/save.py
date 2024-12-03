@@ -1961,3 +1961,79 @@ if __name__ == "__main__":
         self.profile["total derivative time"] += time1 - time0
         
         return dfdx
+
+
+          # a1 = np.dot(du_t.T, du_t) + ff
+                # a2 = 2 * np.dot((Du + du_bar).T, du_t) + 2 * Dl * ff
+                # a3 = np.dot((Du + du_bar).T, (Du + du_bar)) + Dl**2 * ff - Ds**2
+
+                # if k == 0 and n > 0:
+
+                #     # choose the solution
+                #     sign = np.sign(np.dot(Du.T, du_t) + Dl)
+                #     if sign > 0:
+                #         dl = Ds / np.sqrt(1 + np.dot(du_t.T, du_t))
+                #     else:
+                #         dl = -Ds / np.sqrt(1 + np.dot(du_t.T, du_t))
+
+                #     du = du_bar + dl * du_t
+
+                #     # if np.sign(dl1) == sign1:
+                #     #     dl = dl1
+                #     #     du = du1
+                #     # else:
+                #     #     dl = dl2
+                #     #     du = du2
+
+                #     # # choose the solution
+                #     # dot1 = (Du + du1).T @ Du + Dl * (Dl + dl1) * ff
+                #     # dot2 = (Du + du2).T @ Du + Dl * (Dl + dl2) * ff
+
+                #     # if dot1 > dot2:
+                #     #     dl = dl1
+                #     #     du = du1
+                #     # else:
+                #     #     dl = dl2
+                #     #     du = du2
+
+                # elif k > 0 and n > 0:
+                #     # solve the quadratic equation
+                #     dl1 = (-a2 + np.sqrt(a2**2 - 4 * a1 * a3)) / (2 * a1)
+                #     dl2 = (-a2 - np.sqrt(a2**2 - 4 * a1 * a3)) / (2 * a1)
+
+                #     du1 = du_bar + dl1 * du_t
+                #     du2 = du_bar + dl2 * du_t
+
+                #     # t = np.dot(Du.T, du_t) + Dl
+
+                #     # if t * dl1 > t * dl2:
+                #     #     dl = dl1
+                #     # else:
+                #     #     dl = dl2
+
+                #     # du = du_bar + dl * du_t
+
+                #     # choose the solution
+                #     dot1 = (Du + du1).T @ Du + Dl * (Dl + dl1) * ff
+                #     dot2 = (Du + du2).T @ Du + Dl * (Dl + dl2) * ff
+
+                #     if dot1 > dot2:
+                #         dl = dl1
+                #         du = du1
+                #     else:
+                #         dl = dl2
+                #         du = du2
+
+                # else:
+
+                # # # construct the matrix and solve the linear system
+                # mat = sparse.bmat([[Ktr, -fr], [ar.T, b]], format="csc")
+                # dx = sparse.linalg.spsolve(mat, -np.vstack([Rr, A]))
+                # du = self.full_vector(dx[:-1])
+                # dl = dx[-1]
+
+
+                # Ktr = self.reduce_matrix(Kt)
+                # Rr = self.reduce_vector(R).reshape(-1, 1)
+                # ar = self.reduce_vector(a).reshape(-1, 1)
+                # b = sparse.csc_matrix(b).reshape(-1, 1)

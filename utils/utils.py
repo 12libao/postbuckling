@@ -194,7 +194,7 @@ class Logger:
 
     def write_output_buckling(self):
         self.write_stdout()
-        self.write_adjoint() if "aggregate" in self.args.confs else None
+        self.write_blf()
 
         if self.iter % self.draw_every == 0:
             self.write_design_buckling()
@@ -430,7 +430,7 @@ class Logger:
         ):
             self.foi["c/c0"] = self.paropt.c_norm
             self.foi["ks/ks0"] = self.paropt.ks_norm
-            
+
         if (
             self.args.objf
             in {
@@ -474,16 +474,7 @@ class Logger:
         for xi in xib:
             xi *= np.linalg.norm(self.prob.topo.Q0)
 
-            if (
-                self.args.objf
-                in {
-                    "koiter-ks-lams-b",
-                    "koiter-ks-lamc-b",
-                    "koiter-ks-lams-bc",
-                    "compliance-buckling",
-                }
-                or "koiter-b" in self.args.confs
-            ):
+            if self.prob.topo.a < 1e-12:
                 lam_s = self.prob.topo.get_lams_b(
                     self.prob.topo.lam[0], self.prob.topo.b, xi
                 )
@@ -606,6 +597,23 @@ class Logger:
 
         return
 
+    def write_blf(self):
+        # Log eigenvalues
+        with open(os.path.join(self.args.prefix, "BLF.log"), "a") as f:
+            if self.iter % 10 == 0:
+                f.write("\n%10s" % "iter")
+                for i in range(len(self.prob.topo.BLF)):
+                    name = "BLF[%d]" % i
+                    f.write("%20s" % name)
+                f.write("\n")
+
+            f.write("%10d" % self.iter)
+            for i in range(len(self.prob.topo.BLF)):
+                f.write("%20.10e" % self.prob.topo.BLF[i])
+            f.write("\n")
+
+        return
+
     def write_eigenvectors(self, x=5, y=5):
         eig_dir = os.path.join(self.args.prefix, "eigenvectors")
         os.makedirs(eig_dir, exist_ok=True)
@@ -712,6 +720,9 @@ class Logger:
 
         # if "h_ub" in self.args:
         #     self.args.prefix = self.args.prefix + ", h=" + str(self.args.h_ub)
+
+        if "compliance" in self.args.confs:
+            self.args.prefix = self.args.prefix + ", c=" + str(self.args.c_ub)
 
         # if "sigma" in self.args:
         #     self.args.prefix = self.args.prefix + ", s=" + str(self.args.sigma)
